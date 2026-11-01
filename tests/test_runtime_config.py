@@ -55,6 +55,27 @@ assert sum(type(handler) is CallbackQueryHandler for handler in handlers) == 1
         result = self._run_python(code)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_welcome_buttons_use_new_names_and_urls(self):
+        code = """import asyncio
+import bot
+class FakeMessage:
+    async def reply_text(self, text, reply_markup=None):
+        self.text = text
+        self.reply_markup = reply_markup
+async def run():
+    message = FakeMessage()
+    await bot._reply_welcome(message, 'Tester')
+    buttons = [button for row in message.reply_markup.inline_keyboard for button in row]
+    assert [button.text for button in buttons] == ['ONGOING ANIME', 'ANIME REQUEST GROUP']
+    assert [button.url for button in buttons] == [
+        'https://t.me/+1CcAFHLS2tU4YWVl',
+        'https://t.me/+1jDuhUQ41hA1YmVl',
+    ]
+asyncio.run(run())
+"""
+        result = self._run_python(code)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_render_web_server_starts_when_port_is_set(self):
         code = """import asyncio
 import main

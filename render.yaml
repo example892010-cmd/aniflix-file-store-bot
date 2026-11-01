@@ -30,8 +30,8 @@ services:
       - key: DEVELOPER_CREDIT
         value: "@TANJIROKAMADO404"
       - key: UPDATES_URL
-        value: "https://t.me/+98iAagsDsjI5NDk1"
+        value: "https://t.me/+1CcAFHLS2tU4YWVl"
       - key: ONGOING_URL
-        value: "https://t.me/+98iAagsDsjI5NDk1"
+        value: "https://t.me/+1CcAFHLS2tU4YWVl"
       - key: SUPPORT_URL
         value: "https://t.me/+1jDuhUQ41hA1YmVl"

@@ -69,6 +69,7 @@ class AniflixBot(Client):
         )
         self.archive_channel_id = self.settings.archive_channel_id
         self.state_store = StateStore(self, self.archive_channel_id)
+        # Keep Pyrogram Client.storage reserved for its internal MTProto session backend.
         self.file_storage = Storage(self, self.archive_channel_id)
         self.batch_reader = None
         if self.settings.batch_user_session_string:
@@ -222,8 +223,8 @@ async def _reply_welcome(message: Message, first_name: str = "there"):
         "Send me media or use `/getlink` and `/batch` to store and generate sharing links."
     )
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Channel", url="https://t.me/Aniflix_Bots"),
-         InlineKeyboardButton("Support", url="https://t.me/Aniflix_Support")]
+        [InlineKeyboardButton("ONGOING ANIME", url=bot.settings.ongoing_url)],
+        [InlineKeyboardButton("ANIME REQUEST GROUP", url=bot.settings.support_url)],
     ])
     await message.reply_text(welcome, reply_markup=kb)
 
@@ -437,7 +438,7 @@ async def _batch_endpoint(client: Client, message: Message):
 
 
 def _normalize_messages(result):
-    """Return fetched source messages in original Telegram message-ID order."""
+    """Normalize Telegram results and preserve original channel message order."""
     if isinstance(result, (list, tuple)):
         messages = [item for item in result if item and not getattr(item, "empty", False)]
     elif result is None or getattr(result, "empty", False):
