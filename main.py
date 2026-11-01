@@ -1,60 +1,64 @@
-"""Render Web Service entry point with a Telegram bot and health endpoint."""
-from __future__ import annotations
-
 import asyncio
 import logging
-
 from aiohttp import web
 from pyrogram import idle
-
-from bot import AniflixBot, register_handlers
-from config import load_settings
+from bot import bot, register_handlers
 
 logging.basicConfig(
     level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-HEALTH = {"ready": False, "bot": None}
+logger = logging.getLogger("MAIN")
 
 
-async def health_handler(_request):
-    if not HEALTH["ready"]:
-        return web.json_response({"status": "starting"}, status=503)
-    return web.json_response({"status": "ok", "bot": "ANIFLIX FILE STORE BOT"})
+async def health_check(request):
+    """Render health check / keep-alive endpoint."""
+    return web.Response(text="Bot is running!")
 
 
-async def root_handler(_request):
-    return web.Response(
-        text="ANIFLIX FILE STORE BOT is running. Health endpoint: /health",
-        content_type="text/plain",
-    )
-
-
-async def run():
-    settings = load_settings()
+async def start_web_server():
+    """Starts lightweight web server for Render Free port binding."""
     app = web.Application()
-    app.router.add_get("/", root_handler)
-    app.router.add_get("/health", health_handler)
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", settings.port)
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
+    logger.info(f"Web server started on port {port}")
+    return runner
 
-    bot = AniflixBot(settings)
+
+async def main():
+    import os
+    # Start web server if PORT is set (Render Web Service)
+    web_runner = None
+    if os.environ.get("PORT"):
+        web_runner = await start_web_server()
+
+    # Register any extra handlers if defined
     register_handlers(bot)
-    HEALTH["bot"] = bot
-    try:
-        await bot.start()
-        await bot.verify_archive_access()
-        HEALTH["ready"] = True
-        logging.getLogger("aniflix").info("Bot is ready and health check is live")
-        await idle()
-    finally:
-        HEALTH["ready"] = False
-        if getattr(bot, "is_connected", False):
-            await bot.stop()
-        await runner.cleanup()
+
+    # Start Pyrogram Bot
+    await bot.start()
+    logger.info("Aniflix File Store Bot is fully online.")
+
+    # Keep running until terminated
+    await idle()
+
+    # Graceful shutdown
+    await bot.stop()
+    if web_runner:
+        await web_runner.cleanup()
 
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    import os
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot execution interrupted.")
+    finally:
+        loop.close()
