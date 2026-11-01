@@ -1,160 +1,197 @@
-"""Telegram-channel-backed settings and user registry (no external database)."""
-from __future__ import annotations
-
-import base64
 import json
-import zlib
-from copy import deepcopy
+import os
+import logging
+from typing import Dict, Any, Optional
+from pyrogram import Client
+from pyrogram.errors import RPCError
 
-STATE_PREFIX = "ANIFLIX_STATE_V1:"
-USER_PREFIX = "ANIFLIX_USER_V1:"
+logger = logging.getLogger(__name__)
 
+STATE_TAG = "#ANIFLIX_STATE_STORE_V1#"
+LOCAL_STATE_FILE = "bot_state_data.json"
 
-def _encode_json(value: object) -> str:
-    raw = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    compressed = zlib.compress(raw, level=9)
-    return base64.urlsafe_b64encode(compressed).decode("ascii").rstrip("=")
-
-
-def _decode_json(value: str) -> object:
-    padded = value + "=" * (-len(value) % 4)
-    compressed = base64.urlsafe_b64decode(padded.encode("ascii"))
-    return json.loads(zlib.decompress(compressed).decode("utf-8"))
-
-
-def default_state() -> dict:
-    return {
-        "welcome": {"kind": "text", "text": "Welcome to ANIFLIX FILE BOT!", "photo_id": None},
-        "fsub_message": {
-            "kind": "text",
-            "text": "Join the below channels to continue, then press TRY AGAIN.",
-            "photo_id": None,
-        },
-        "fsub_channels": [],
-        "extra_admins": [],
-        "global_paused": False,
-        "links_count": {"getlink": 0, "batch": 0, "messages": 0, "failed": 0},
-    }
+DEFAULT_STATE: Dict[str, Any] = {
+    "admins": [],
+    "fsub_channels": [],
+    "fsub_message": None,
+    "welcome_message": None,
+    "stats": {
+        "total_users": 0,
+        "total_links": 0,
+        "total_files": 0,
+        "total_views": 0
+    },
+    "users": []
+}
 
 
-class TelegramStateStore:
-    """Persists small settings and user records as private archive-channel posts.
-
-    The configured archive channel must be private and writable by the bot. This
-    keeps settings and the user registry available across Render restarts without
-    MongoDB or an ephemeral local file.
-    """
-
-    def __init__(self, client, archive_channel_id: int):
+class StateStore:
+    def __init__(self, client: Client, archive_channel_id: int):
         self.client = client
-        self.archive_channel_id = int(archive_channel_id)
-        self.state = default_state()
-        self.state_message_id: int | None = None
-        self.users: dict[int, dict] = {}
+        self.archive_channel_id = archive_channel_id
+        self.state: Dict[str, Any] = json.loads(json.dumps(DEFAULT_STATE))
+        self.state_message_id: Optional[int] = None
 
-    async def load(self) -> None:
-        latest_state = None
-        latest_state_id = None
-        async for message in self.client.get_chat_history(self.archive_channel_id):
-            text = getattr(message, "text", None) or getattr(message, "caption", None) or ""
-            if text.startswith(STATE_PREFIX) and latest_state is None:
-                try:
-                    decoded = _decode_json(text[len(STATE_PREFIX):])
-                    if isinstance(decoded, dict):
-                        latest_state = decoded
-                        latest_state_id = message.id
-                except Exception:
-                    continue
-            elif text.startswith(USER_PREFIX):
-                try:
-                    record = _decode_json(text[len(USER_PREFIX):])
-                    user_id = int(record["id"])
-                    if user_id > 0 and user_id not in self.users:
-                        self.users[user_id] = record
-                except Exception:
-                    continue
-        if latest_state is not None:
-            merged = default_state()
-            merged.update(latest_state)
-            self.state = merged
-            self.state_message_id = latest_state_id
-        else:
-            await self.save()
+    def _merge_defaults(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        result = json.loads(json.dumps(DEFAULT_STATE))
+        if isinstance(data, dict):
+            for k, v in data.items():
+                if k == "stats" and isinstance(v, dict):
+                    result["stats"].update(v)
+                else:
+                    result[k] = v
+        return result
 
-    async def save(self) -> None:
-        encoded = _encode_json(self.state)
-        text = STATE_PREFIX + encoded
-        if len(text) > 3900:
-            raise ValueError("Admin settings are too large to persist in one Telegram message")
-        sent = await self.client.send_message(
-            self.archive_channel_id,
-            text,
-            disable_notification=True,
-            parse_mode="disabled",
-        )
-        new_id = int(sent.id)
-        old_id = self.state_message_id
-        self.state_message_id = new_id
-        if old_id and old_id != new_id:
+    def _load_local_state(self) -> bool:
+        if os.path.exists(LOCAL_STATE_FILE):
             try:
-                await self.client.delete_messages(self.archive_channel_id, old_id)
-            except Exception:
-                # The newest state record wins during the next startup scan.
-                pass
+                with open(LOCAL_STATE_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.state = self._merge_defaults(data)
+                    self.state_message_id = data.get("_state_message_id")
+                    logger.info("Loaded state from local cache.")
+                    return True
+            except Exception as e:
+                logger.warning(f"Failed to read local state file: {e}")
+        return False
 
-    async def register_user(self, user) -> bool:
-        user_id = int(getattr(user, "id", 0) or 0)
-        if user_id <= 0 or user_id in self.users:
-            return False
-        record = {
-            "id": user_id,
-            "first_name": (getattr(user, "first_name", "") or "")[:80],
-            "last_name": (getattr(user, "last_name", "") or "")[:80],
-            "username": (getattr(user, "username", "") or "")[:64],
-        }
-        marker = USER_PREFIX + _encode_json(record)
-        if len(marker) > 1000:
-            raise ValueError("User registry record is too large")
-        await self.client.send_message(
-            self.archive_channel_id,
-            marker,
-            disable_notification=True,
-            parse_mode="disabled",
-        )
-        self.users[user_id] = record
-        return True
+    def _save_local_state(self):
+        try:
+            to_save = dict(self.state)
+            to_save["_state_message_id"] = self.state_message_id
+            with open(LOCAL_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(to_save, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to write local state file: {e}")
 
-    def add_user_record(self, record: dict) -> None:
-        """Used by tests and startup restoration."""
-        user_id = int(record.get("id", 0))
-        if user_id > 0:
-            self.users[user_id] = deepcopy(record)
+    async def load_state(self):
+        """Loads state using pinned channel message and local cache without get_chat_history."""
+        self._load_local_state()
 
-    def admins(self, owner_id: int, configured_admins) -> set[int]:
-        values = {int(owner_id), *(int(x) for x in configured_admins)}
-        values.update(int(x) for x in self.state.get("extra_admins", []))
-        return values
+        if not self.archive_channel_id:
+            logger.warning("No archive_channel_id configured; relying solely on memory/local state.")
+            return
 
-    async def add_admin(self, user_id: int, owner_id: int) -> bool:
-        user_id = int(user_id)
-        if user_id <= 0:
-            raise ValueError("Admin ID must be a positive Telegram user ID")
-        extras = set(int(x) for x in self.state.get("extra_admins", []))
-        if user_id == int(owner_id) or user_id in extras:
-            return False
-        extras.add(user_id)
-        self.state["extra_admins"] = sorted(extras)
-        await self.save()
-        return True
+        try:
+            chat = await self.client.get_chat(self.archive_channel_id)
+            pinned = getattr(chat, "pinned_message", None)
 
-    async def remove_admin(self, user_id: int, owner_id: int, configured_admins) -> bool:
-        user_id = int(user_id)
-        if user_id == int(owner_id) or user_id in set(map(int, configured_admins)):
-            raise ValueError("The owner and environment-configured admins cannot be removed here")
-        extras = set(int(x) for x in self.state.get("extra_admins", []))
-        if user_id not in extras:
-            return False
-        extras.remove(user_id)
-        self.state["extra_admins"] = sorted(extras)
-        await self.save()
-        return True
+            if pinned and pinned.text and STATE_TAG in pinned.text:
+                self.state_message_id = pinned.id
+                raw_json = pinned.text.split(STATE_TAG, 1)[1].strip()
+                data = json.loads(raw_json)
+                self.state = self._merge_defaults(data)
+                self._save_local_state()
+                logger.info("Successfully loaded state from pinned archive message.")
+                return
+
+            if self.state_message_id:
+                try:
+                    msg = await self.client.get_messages(self.archive_channel_id, self.state_message_id)
+                    if msg and msg.text and STATE_TAG in msg.text:
+                        raw_json = msg.text.split(STATE_TAG, 1)[1].strip()
+                        data = json.loads(raw_json)
+                        self.state = self._merge_defaults(data)
+                        self._save_local_state()
+                        logger.info("Successfully loaded state from tracked state_message_id.")
+                        return
+                except Exception as inner_e:
+                    logger.debug(f"Could not load state by stored message ID: {inner_e}")
+
+            logger.info("No remote state message found. Creating initial pinned state message...")
+            await self.save_state()
+
+        except RPCError as e:
+            logger.error(f"Pyrogram RPC error while loading state from archive channel: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error loading state: {e}")
+
+    async def save_state(self):
+        """Saves current state by updating or creating the pinned archive message."""
+        self._save_local_state()
+
+        if not self.archive_channel_id:
+            return
+
+        content = f"{STATE_TAG}\n" + json.dumps(self.state, ensure_ascii=False, indent=2)
+
+        try:
+            if self.state_message_id:
+                try:
+                    await self.client.edit_message_text(
+                        chat_id=self.archive_channel_id,
+                        message_id=self.state_message_id,
+                        text=content
+                    )
+                    return
+                except RPCError as e:
+                    logger.warning(f"Failed to edit existing state message {self.state_message_id}: {e}. Creating new one.")
+
+            msg = await self.client.send_message(
+                chat_id=self.archive_channel_id,
+                text=content
+            )
+            self.state_message_id = msg.id
+            self._save_local_state()
+
+            try:
+                await self.client.pin_chat_message(
+                    chat_id=self.archive_channel_id,
+                    message_id=msg.id,
+                    both_sides=True
+                )
+            except Exception as pin_err:
+                logger.warning(f"Could not pin state message (check bot pin permissions): {pin_err}")
+
+        except Exception as e:
+            logger.error(f"Failed to save state to archive channel: {e}")
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.state.get(key, default)
+
+    async def set(self, key: str, value: Any):
+        self.state[key] = value
+        await self.save_state()
+
+    def get_stats(self) -> Dict[str, int]:
+        return self.state.get("stats", DEFAULT_STATE["stats"])
+
+    async def update_stats(self, **kwargs):
+        stats = self.state.setdefault("stats", dict(DEFAULT_STATE["stats"]))
+        for k, v in kwargs.items():
+            if k in stats:
+                stats[k] += v
+            else:
+                stats[k] = v
+        await self.save_state()
+
+    def get_admins(self) -> list:
+        return self.state.get("admins", [])
+
+    async def add_admin(self, user_id: int):
+        admins = set(self.state.get("admins", []))
+        admins.add(user_id)
+        self.state["admins"] = list(admins)
+        await self.save_state()
+
+    async def remove_admin(self, user_id: int):
+        admins = set(self.state.get("admins", []))
+        admins.discard(user_id)
+        self.state["admins"] = list(admins)
+        await self.save_state()
+
+    def get_fsub_channels(self) -> list:
+        return self.state.get("fsub_channels", [])
+
+    async def set_fsub_channels(self, channels: list):
+        self.state["fsub_channels"] = channels[:10]
+        await self.save_state()
+
+    async def record_user(self, user_id: int):
+        users = set(self.state.get("users", []))
+        if user_id not in users:
+            users.add(user_id)
+            self.state["users"] = list(users)
+            stats = self.state.setdefault("stats", dict(DEFAULT_STATE["stats"]))
+            stats["total_users"] = len(users)
+            await self.save_state()
