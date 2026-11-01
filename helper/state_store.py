@@ -1,0 +1,209 @@
+import json
+import os
+import logging
+from typing import Dict, Any, Optional
+from pyrogram import Client
+from pyrogram.errors import RPCError
+
+logger = logging.getLogger(__name__)
+
+STATE_TAG = "#ANIFLIX_STATE_STORE_V1#"
+LOCAL_STATE_FILE = "bot_state_data.json"
+
+DEFAULT_STATE: Dict[str, Any] = {
+    "admins": [],
+    "fsub_channels": [],
+    "fsub_message": None,
+    "welcome_message": None,
+    "stats": {
+        "total_users": 0,
+        "total_links": 0,
+        "total_files": 0,
+        "total_views": 0
+    },
+    "users": []
+}
+
+
+class StateStore:
+    def __init__(self, client: Client, archive_channel_id: int):
+        self.client = client
+        self.archive_channel_id = archive_channel_id
+        self.state: Dict[str, Any] = json.loads(json.dumps(DEFAULT_STATE))
+        self.state_message_id: Optional[int] = None
+
+    def _merge_defaults(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        result = json.loads(json.dumps(DEFAULT_STATE))
+        if isinstance(data, dict):
+            for k, v in data.items():
+                if k == "stats" and isinstance(v, dict):
+                    result["stats"].update(v)
+                else:
+                    result[k] = v
+        return result
+
+    def _load_local_state(self) -> bool:
+        if os.path.exists(LOCAL_STATE_FILE):
+            try:
+                with open(LOCAL_STATE_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.state = self._merge_defaults(data)
+                    self.state_message_id = data.get("_state_message_id")
+                    self.state.pop("_state_message_id", None)
+                    logger.info("Loaded state from local cache.")
+                    return True
+            except Exception as e:
+                logger.warning(f"Failed to read local state file: {e}")
+        return False
+
+    def _save_local_state(self):
+        try:
+            to_save = dict(self.state)
+            to_save["_state_message_id"] = self.state_message_id
+            temporary_path = LOCAL_STATE_FILE + ".tmp"
+            with open(temporary_path, "w", encoding="utf-8") as f:
+                json.dump(to_save, f, ensure_ascii=False, indent=2)
+            os.replace(temporary_path, LOCAL_STATE_FILE)
+        except Exception as e:
+            logger.warning(f"Failed to write local state file: {e}")
+
+    async def load_state(self):
+        """Loads state using pinned channel message and local cache without get_chat_history."""
+        self._load_local_state()
+
+        if not self.archive_channel_id:
+            logger.warning("No archive_channel_id configured; relying solely on memory/local state.")
+            return
+
+        try:
+            chat = await self.client.get_chat(self.archive_channel_id)
+            pinned = getattr(chat, "pinned_message", None)
+
+            if pinned and pinned.text and STATE_TAG in pinned.text:
+                self.state_message_id = pinned.id
+                raw_json = pinned.text.split(STATE_TAG, 1)[1].strip()
+                data = json.loads(raw_json)
+                self.state = self._merge_defaults(data)
+                self._save_local_state()
+                logger.info("Successfully loaded state from pinned archive message.")
+                return
+
+            if self.state_message_id:
+                try:
+                    msg = await self.client.get_messages(self.archive_channel_id, self.state_message_id)
+                    if msg and msg.text and STATE_TAG in msg.text:
+                        raw_json = msg.text.split(STATE_TAG, 1)[1].strip()
+                        data = json.loads(raw_json)
+                        self.state = self._merge_defaults(data)
+                        self._save_local_state()
+                        logger.info("Successfully loaded state from tracked state_message_id.")
+                        return
+                except Exception as inner_e:
+                    logger.debug(f"Could not load state by stored message ID: {inner_e}")
+
+            logger.info("No remote state message found. Creating initial pinned state message...")
+            await self.save_state()
+
+        except RPCError as e:
+            logger.error(f"Pyrogram RPC error while loading state from archive channel: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error loading state: {e}")
+
+    async def save_state(self):
+        """Saves current state by updating or creating the pinned archive message."""
+        self._save_local_state()
+
+        if not self.archive_channel_id:
+            return
+
+        content = f"{STATE_TAG}\n" + json.dumps(self.state, ensure_ascii=False, indent=2)
+        if len(content) > 4000:
+            logger.error(
+                "State is too large for one Telegram text message (%s characters); "
+                "remote state was not updated. Local cache is not durable on Render Free.",
+                len(content),
+            )
+            return
+
+        try:
+            if self.state_message_id:
+                try:
+                    await self.client.edit_message_text(
+                        chat_id=self.archive_channel_id,
+                        message_id=self.state_message_id,
+                        text=content,
+                        parse_mode=None,
+                    )
+                    return
+                except RPCError as e:
+                    logger.warning(f"Failed to edit existing state message {self.state_message_id}: {e}. Creating new one.")
+
+            msg = await self.client.send_message(
+                chat_id=self.archive_channel_id,
+                text=content,
+                parse_mode=None,
+            )
+            self.state_message_id = msg.id
+            self._save_local_state()
+
+            try:
+                await self.client.pin_chat_message(
+                    chat_id=self.archive_channel_id,
+                    message_id=msg.id,
+                    both_sides=True
+                )
+            except Exception as pin_err:
+                logger.warning(f"Could not pin state message (check bot pin permissions): {pin_err}")
+
+        except Exception as e:
+            logger.error(f"Failed to save state to archive channel: {e}")
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.state.get(key, default)
+
+    async def set(self, key: str, value: Any):
+        self.state[key] = value
+        await self.save_state()
+
+    def get_stats(self) -> Dict[str, int]:
+        return self.state.get("stats", DEFAULT_STATE["stats"])
+
+    async def update_stats(self, **kwargs):
+        stats = self.state.setdefault("stats", dict(DEFAULT_STATE["stats"]))
+        for k, v in kwargs.items():
+            if k in stats:
+                stats[k] += v
+            else:
+                stats[k] = v
+        await self.save_state()
+
+    def get_admins(self) -> list:
+        return self.state.get("admins", [])
+
+    async def add_admin(self, user_id: int):
+        admins = set(self.state.get("admins", []))
+        admins.add(user_id)
+        self.state["admins"] = list(admins)
+        await self.save_state()
+
+    async def remove_admin(self, user_id: int):
+        admins = set(self.state.get("admins", []))
+        admins.discard(user_id)
+        self.state["admins"] = list(admins)
+        await self.save_state()
+
+    def get_fsub_channels(self) -> list:
+        return self.state.get("fsub_channels", [])
+
+    async def set_fsub_channels(self, channels: list):
+        self.state["fsub_channels"] = channels[:10]
+        await self.save_state()
+
+    async def record_user(self, user_id: int):
+        users = set(self.state.get("users", []))
+        if user_id not in users:
+            users.add(user_id)
+            self.state["users"] = list(users)
+            stats = self.state.setdefault("stats", dict(DEFAULT_STATE["stats"]))
+            stats["total_users"] = len(users)
+            await self.save_state()
