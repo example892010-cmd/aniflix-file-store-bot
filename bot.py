@@ -17,7 +17,7 @@ from pyrogram.errors import (
     MessageNotModified
 )
 
-from config import Config
+import config
 from helper.state_store import StateStore
 from helper.link_codec import encode_message_id, decode_message_id, encode_batch, decode_batch
 from helper.storage import Storage
@@ -34,17 +34,39 @@ USER_UPLOAD_SESSIONS: Dict[int, Dict] = {}
 USER_BATCH_SESSIONS: Dict[int, Dict] = {}
 
 
+def _get_archive_channel_id() -> int:
+    val = getattr(config, "ARCHIVE_CHANNEL_ID", getattr(config, "DB_CHANNEL_ID", 0))
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _get_admins() -> List[int]:
+    admins = getattr(config, "ADMINS", getattr(config, "ADMIN_IDS", []))
+    if isinstance(admins, str):
+        return [int(x.strip()) for x in admins.split(",") if x.strip().lstrip("-").isdigit()]
+    if isinstance(admins, (list, set, tuple)):
+        return [int(x) for x in admins if str(x).lstrip("-").isdigit()]
+    return []
+
+
+def _get_fsub_channels() -> List[Dict]:
+    return getattr(config, "FSUB_CHANNELS", [])
+
+
 class AniflixBot(Client):
     def __init__(self):
         super().__init__(
             name="AniflixFileStoreBot",
-            api_id=Config.API_ID,
-            api_hash=Config.API_HASH,
-            bot_token=Config.BOT_TOKEN,
+            api_id=getattr(config, "API_ID", None),
+            api_hash=getattr(config, "API_HASH", None),
+            bot_token=getattr(config, "BOT_TOKEN", None),
             workers=8
         )
-        self.state_store = StateStore(self, Config.ARCHIVE_CHANNEL_ID)
-        self.storage = Storage(self, Config.ARCHIVE_CHANNEL_ID)
+        self.archive_channel_id = _get_archive_channel_id()
+        self.state_store = StateStore(self, self.archive_channel_id)
+        self.storage = Storage(self, self.archive_channel_id)
 
     async def start(self):
         await super().start()
@@ -67,7 +89,7 @@ bot = AniflixBot()
 # ------------------- HELPER FUNCTIONS ------------------- #
 
 def is_admin(user_id: int) -> bool:
-    if user_id in Config.ADMINS:
+    if user_id in _get_admins():
         return True
     admins = bot.state_store.get_admins()
     return user_id in admins
@@ -76,8 +98,8 @@ def is_admin(user_id: int) -> bool:
 async def check_fsub(client: Client, user_id: int) -> List[Dict]:
     """Returns a list of FSUB channels that the user hasn't joined yet."""
     fsub_channels = bot.state_store.get_fsub_channels()
-    if not fsub_channels and Config.FSUB_CHANNELS:
-        fsub_channels = Config.FSUB_CHANNELS
+    if not fsub_channels:
+        fsub_channels = _get_fsub_channels()
 
     unjoined = []
     for ch in fsub_channels:
@@ -131,7 +153,6 @@ async def start_handler(client: Client, message: Message):
 
         # Process link payload
         if param.startswith("batch_"):
-            # Batch link decoding
             try:
                 start_id, end_id = decode_batch(param[6:])
                 status_msg = await message.reply_text("⏳ Fetching requested files...")
@@ -140,7 +161,7 @@ async def start_handler(client: Client, message: Message):
                     try:
                         await client.copy_message(
                             chat_id=user_id,
-                            from_chat_id=Config.ARCHIVE_CHANNEL_ID,
+                            from_chat_id=bot.archive_channel_id,
                             message_id=mid
                         )
                         sent_count += 1
@@ -149,7 +170,7 @@ async def start_handler(client: Client, message: Message):
                         await asyncio.sleep(f.value)
                         await client.copy_message(
                             chat_id=user_id,
-                            from_chat_id=Config.ARCHIVE_CHANNEL_ID,
+                            from_chat_id=bot.archive_channel_id,
                             message_id=mid
                         )
                         sent_count += 1
@@ -163,12 +184,11 @@ async def start_handler(client: Client, message: Message):
                 logger.error(f"Batch decoding error: {e}")
                 return await message.reply_text("❌ This batch link is corrupted, invalid, or expired.")
         else:
-            # Single file link decoding
             try:
                 mid = decode_message_id(param)
                 await client.copy_message(
                     chat_id=user_id,
-                    from_chat_id=Config.ARCHIVE_CHANNEL_ID,
+                    from_chat_id=bot.archive_channel_id,
                     message_id=mid
                 )
                 await bot.state_store.update_stats(total_views=1)
@@ -190,7 +210,7 @@ async def start_handler(client: Client, message: Message):
     await message.reply_text(welcome, reply_markup=kb)
 
 
-# ------------------- COMMAND: /GETLINK (Interactive Upload) ------------------- #
+# ------------------- COMMAND: /GETLINK ------------------- #
 
 @bot.on_message(filters.command("getlink") & filters.private)
 async def getlink_handler(client: Client, message: Message):
@@ -369,12 +389,10 @@ async def incoming_private_messages(client: Client, message: Message):
 
             status_msg = await message.reply_text(f"⏳ Processing `{end_id - start_id + 1}` messages into Archive...")
 
-            # Store range into Archive channel using get_messages (Bot API supported)
             archived_first_id = None
             archived_last_id = None
             stored_count = 0
 
-            # Retrieve messages sequentially/in chunks
             all_ids = list(range(start_id, end_id + 1))
             for i in range(0, len(all_ids), 200):
                 chunk = all_ids[i:i + 200]
@@ -391,7 +409,7 @@ async def incoming_private_messages(client: Client, message: Message):
                     if not src_msg or src_msg.empty:
                         continue
                     try:
-                        copied = await src_msg.copy(chat_id=Config.ARCHIVE_CHANNEL_ID)
+                        copied = await src_msg.copy(chat_id=bot.archive_channel_id)
                         if archived_first_id is None:
                             archived_first_id = copied.id
                         archived_last_id = copied.id
@@ -399,7 +417,7 @@ async def incoming_private_messages(client: Client, message: Message):
                         await asyncio.sleep(0.2)
                     except FloodWait as f:
                         await asyncio.sleep(f.value)
-                        copied = await src_msg.copy(chat_id=Config.ARCHIVE_CHANNEL_ID)
+                        copied = await src_msg.copy(chat_id=bot.archive_channel_id)
                         if archived_first_id is None:
                             archived_first_id = copied.id
                         archived_last_id = copied.id
@@ -422,7 +440,7 @@ async def incoming_private_messages(client: Client, message: Message):
 
     # Handle /getlink active recording session
     if user_id in USER_UPLOAD_SESSIONS and USER_UPLOAD_SESSIONS[user_id].get("status") == "recording":
-        copied = await message.copy(chat_id=Config.ARCHIVE_CHANNEL_ID)
+        copied = await message.copy(chat_id=bot.archive_channel_id)
         USER_UPLOAD_SESSIONS[user_id]["message_ids"].append(copied.id)
         count = len(USER_UPLOAD_SESSIONS[user_id]["message_ids"])
 
@@ -436,9 +454,9 @@ async def incoming_private_messages(client: Client, message: Message):
             reply_markup=InlineKeyboardMarkup(buttons)
         )
 
-    # Single-file direct upload when not in a session
+    # Single-file direct upload
     if message.media or message.document:
-        copied = await message.copy(chat_id=Config.ARCHIVE_CHANNEL_ID)
+        copied = await message.copy(chat_id=bot.archive_channel_id)
         link_hash = encode_message_id(copied.id)
         file_url = f"https://t.me/{bot.username}?start={link_hash}"
         await bot.state_store.update_stats(total_links=1, total_files=1)
@@ -463,7 +481,6 @@ async def callback_router(client: Client, query: CallbackQuery):
         await query.answer("✅ Verification passed!")
         await query.message.delete()
         if param:
-            # Replay the user command with payload
             query.message.from_user = query.from_user
             query.message.command = ["start", param]
             return await start_handler(client, query.message)
@@ -564,7 +581,10 @@ async def callback_router(client: Client, query: CallbackQuery):
         )
 
 
-# ------------------- ENTRY POINT ------------------- #
+def register_handlers(app: Client):
+    """Compatibility export for main.py."""
+    pass
+
 
 if __name__ == "__main__":
     bot.run()
