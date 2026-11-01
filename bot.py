@@ -69,7 +69,7 @@ class AniflixBot(Client):
         )
         self.archive_channel_id = self.settings.archive_channel_id
         self.state_store = StateStore(self, self.archive_channel_id)
-        self.storage = Storage(self, self.archive_channel_id)
+        self.file_storage = Storage(self, self.archive_channel_id)
         self.batch_reader = None
         if self.settings.batch_user_session_string:
             # Optional user authorization is isolated to /batch source reads.
@@ -188,7 +188,7 @@ async def _deliver_start_payload(client: Client, user_id: int, message: Message,
                 )
             sent_count = failed_count = 0
             for message_id in range(start_id, end_id + 1):
-                if await bot.storage.deliver_message(
+                if await bot.file_storage.deliver_message(
                     user_id, message_id, bot.settings.protect_content
                 ):
                     sent_count += 1
@@ -205,7 +205,7 @@ async def _deliver_start_payload(client: Client, user_id: int, message: Message,
             return
 
         message_id = decode_message_id(param)
-        if not await bot.storage.deliver_message(
+        if not await bot.file_storage.deliver_message(
             user_id, message_id, bot.settings.protect_content
         ):
             return await message.reply_text("❌ This file is no longer available in the archive.")
@@ -437,11 +437,14 @@ async def _batch_endpoint(client: Client, message: Message):
 
 
 def _normalize_messages(result):
+    """Return fetched source messages in original Telegram message-ID order."""
     if isinstance(result, (list, tuple)):
-        return list(result)
-    if result is None:
-        return []
-    return [result]
+        messages = [item for item in result if item and not getattr(item, "empty", False)]
+    elif result is None or getattr(result, "empty", False):
+        messages = []
+    else:
+        messages = [result]
+    return sorted(messages, key=lambda item: int(item.id))
 
 @bot.on_message(filters.private & ~filters.command(["start", "admin", "getlink", "batch", "broadcast", "users", "status"]))
 async def incoming_private_messages(client: Client, message: Message):
@@ -576,7 +579,7 @@ async def incoming_private_messages(client: Client, message: Message):
                     if not src_msg or src_msg.empty:
                         continue
                     try:
-                        copied = await bot.storage.store_message(src_msg)
+                        copied = await bot.file_storage.store_message(src_msg)
                         if not copied:
                             continue
                         archived_ids.append(copied.id)
@@ -584,7 +587,7 @@ async def incoming_private_messages(client: Client, message: Message):
                         await asyncio.sleep(0.2)
                     except FloodWait as f:
                         await asyncio.sleep(f.value)
-                        copied = await bot.storage.store_message(src_msg)
+                        copied = await bot.file_storage.store_message(src_msg)
                         if not copied:
                             continue
                         archived_ids.append(copied.id)
@@ -624,7 +627,7 @@ async def incoming_private_messages(client: Client, message: Message):
                 f"⚠️ Upload sessions are limited to {MAX_BATCH_MESSAGES} messages. Generate this link or cancel the session."
             )
         try:
-            copied = await bot.storage.store_message(message)
+            copied = await bot.file_storage.store_message(message)
         except Exception as exc:
             logger.exception("Could not archive upload-session message")
             return await message.reply_text(f"❌ File could not be stored: `{exc}`")
@@ -645,7 +648,7 @@ async def incoming_private_messages(client: Client, message: Message):
 
     # Single-file direct upload
     if message.media or message.document:
-        copied = await bot.storage.store_message(message)
+        copied = await bot.file_storage.store_message(message)
         if not copied:
             return await message.reply_text("❌ File could not be verified in the archive. Please retry.")
         link_hash = encode_message_id(copied.id)

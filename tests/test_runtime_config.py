@@ -35,7 +35,10 @@ class RuntimeConfigTests(unittest.TestCase):
             "assert bot.bot.settings.api_hash == 'test_hash'; "
             "assert bot.bot.archive_channel_id == -1001234567890; "
             "assert 123456789 in bot.bot.settings.admins; "
-            "assert bot.bot.bot_token == '123456:TEST_TOKEN'"
+            "assert bot.bot.bot_token == '123456:TEST_TOKEN'; "
+            "assert hasattr(bot.bot.storage, 'open'); "
+            "assert bot.bot.file_storage is not bot.bot.storage; "
+            "assert bot.bot.file_storage.archive_channel_id == -1001234567890"
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
