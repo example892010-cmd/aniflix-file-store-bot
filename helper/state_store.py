@@ -49,6 +49,7 @@ class StateStore:
                     data = json.load(f)
                     self.state = self._merge_defaults(data)
                     self.state_message_id = data.get("_state_message_id")
+                    self.state.pop("_state_message_id", None)
                     logger.info("Loaded state from local cache.")
                     return True
             except Exception as e:
@@ -59,8 +60,10 @@ class StateStore:
         try:
             to_save = dict(self.state)
             to_save["_state_message_id"] = self.state_message_id
-            with open(LOCAL_STATE_FILE, "w", encoding="utf-8") as f:
+            temporary_path = LOCAL_STATE_FILE + ".tmp"
+            with open(temporary_path, "w", encoding="utf-8") as f:
                 json.dump(to_save, f, ensure_ascii=False, indent=2)
+            os.replace(temporary_path, LOCAL_STATE_FILE)
         except Exception as e:
             logger.warning(f"Failed to write local state file: {e}")
 
@@ -114,6 +117,13 @@ class StateStore:
             return
 
         content = f"{STATE_TAG}\n" + json.dumps(self.state, ensure_ascii=False, indent=2)
+        if len(content) > 4000:
+            logger.error(
+                "State is too large for one Telegram text message (%s characters); "
+                "remote state was not updated. Local cache is not durable on Render Free.",
+                len(content),
+            )
+            return
 
         try:
             if self.state_message_id:
@@ -121,7 +131,8 @@ class StateStore:
                     await self.client.edit_message_text(
                         chat_id=self.archive_channel_id,
                         message_id=self.state_message_id,
-                        text=content
+                        text=content,
+                        parse_mode=None,
                     )
                     return
                 except RPCError as e:
@@ -129,7 +140,8 @@ class StateStore:
 
             msg = await self.client.send_message(
                 chat_id=self.archive_channel_id,
-                text=content
+                text=content,
+                parse_mode=None,
             )
             self.state_message_id = msg.id
             self._save_local_state()

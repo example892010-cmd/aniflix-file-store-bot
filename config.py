@@ -23,6 +23,7 @@ class Settings:
     ongoing_url: str = "https://t.me/+98iAagsDsjI5NDk1"
     support_url: str = "https://t.me/+1jDuhUQ41hA1YmVl"
     session_name: str = "aniflix_file_store"
+    batch_user_session_string: str | None = None
 
 
 def _required(env: dict[str, str], name: str, alias: str | None = None) -> str:
@@ -98,4 +99,5 @@ def load_settings(source: dict[str, str] | None = None) -> Settings:
         ongoing_url=_https_or_empty(env, "ONGOING_URL", "https://t.me/+98iAagsDsjI5NDk1"),
         support_url=_https_or_empty(env, "SUPPORT_URL", "https://t.me/+1jDuhUQ41hA1YmVl"),
         session_name=env.get("SESSION_NAME", "aniflix_file_store").strip() or "aniflix_file_store",
+        batch_user_session_string=env.get("BATCH_USER_SESSION_STRING", "").strip() or None,
     )

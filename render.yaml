@@ -17,6 +17,8 @@ services:
         sync: false
       - key: DB_CHANNEL
         sync: false
+      - key: BATCH_USER_SESSION_STRING
+        sync: false
       - key: ADMINS
         value: ""
       - key: PROTECT_CONTENT

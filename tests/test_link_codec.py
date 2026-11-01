@@ -1,35 +1,51 @@
 import unittest
-from helper.link_codec import decode_text, encode_storage_payload, parse_storage_payload
+
+from helper.link_codec import (
+    decode_batch,
+    decode_batch_manifest_id,
+    decode_message_id,
+    encode_batch,
+    encode_batch_manifest_id,
+    encode_message_id,
+)
 
 
 class LinkCodecTests(unittest.TestCase):
-    CHANNEL = -1001234567890
+    def test_single_message_round_trip_and_existing_prefixes(self):
+        for message_id in (1, 987654321, 2**63 + 17):
+            with self.subTest(message_id=message_id):
+                payload = encode_message_id(message_id)
+                self.assertEqual(decode_message_id(payload), message_id)
+                self.assertEqual(decode_message_id(f"file_{payload}"), message_id)
+                self.assertEqual(decode_message_id(f"msg_{payload}"), message_id)
 
-    def test_round_trip_and_payload_limit(self):
-        payload = encode_storage_payload(self.CHANNEL, 987654321)
+    def test_batch_range_round_trip_preserves_old_format(self):
+        payload = encode_batch(98765, 123)
+        self.assertEqual(decode_batch(payload), (123, 98765))
+        self.assertEqual(decode_batch(f"batch_{payload}"), (123, 98765))
+
+    def test_batch_manifest_reference_is_distinct_from_legacy_range(self):
+        payload = encode_batch_manifest_id(987654321)
         self.assertLessEqual(len(payload), 64)
-        self.assertEqual(parse_storage_payload(decode_text(payload), self.CHANNEL), (self.CHANNEL, 987654321))
+        self.assertEqual(decode_batch_manifest_id(payload), 987654321)
+        with self.assertRaises(ValueError):
+            decode_batch(payload)
 
-    def test_rejects_wrong_channel(self):
-        payload = encode_storage_payload(self.CHANNEL, 55)
-        with self.assertRaisesRegex(ValueError, "does not belong"):
-            parse_storage_payload(decode_text(payload), -1009876543210)
-
-    def test_rejects_bad_payloads(self):
-        for payload in ("", "bad!payload", "x" * 65):
+    def test_invalid_inputs_are_rejected(self):
+        for payload in ("", "!", "====", "x" * 100):
             with self.subTest(payload=payload), self.assertRaises(ValueError):
-                decode_text(payload)
-
-    def test_rejects_non_channel_and_non_positive_message(self):
+                decode_message_id(payload)
+        for message_id in (0, -1, 2**64):
+            with self.subTest(message_id=message_id), self.assertRaises(ValueError):
+                encode_message_id(message_id)
+        for ids in ((0, 1), (1, -1)):
+            with self.subTest(ids=ids), self.assertRaises(ValueError):
+                encode_batch(*ids)
         with self.assertRaises(ValueError):
-            encode_storage_payload(-12345, 1)
-        with self.assertRaises(ValueError):
-            encode_storage_payload(self.CHANNEL, 0)
+            decode_batch("not-a-batch")
 
-    def test_legacy_link_compatibility(self):
-        old_payload = f"get-{987654321 * abs(self.CHANNEL)}"
-        from helper.link_codec import encode_text
-        self.assertEqual(parse_storage_payload(decode_text(encode_text(old_payload)), self.CHANNEL), (self.CHANNEL, 987654321))
+    def test_numeric_legacy_single_link_remains_supported(self):
+        self.assertEqual(decode_message_id("987654321"), 987654321)
 
 
 if __name__ == "__main__":

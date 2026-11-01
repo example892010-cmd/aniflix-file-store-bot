@@ -2,6 +2,8 @@
 *.session
 *.session-journal
 *.log
+bot_state_data.json
+bot_state_data.json.tmp
 __pycache__/
 *.py[cod]
 .venv/

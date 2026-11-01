@@ -1,66 +1,68 @@
-# ANIFLIX FILE BOT
+# ANIFLIX FILE STORE BOT
 
-This patch adds the requested message-link workflows and admin tools to the existing Telegram-only ANIFLIX build. Extract this patch over the existing project folder, keeping the folder paths shown in the ZIP.
+A Pyrogram bot that copies submitted messages into a Telegram archive channel and generates Telegram deep links for retrieval. It uses no MongoDB or other database service.
 
-## Commands
+## Commands and current behavior
 
-- `/getlink` — start a private upload session. Send one or more supported messages (text, photos, videos, documents, stickers, audio, voice, animations, captions, and other copyable messages). The bot updates the count and provides **GENERATE LINK**, **CANCEL**, and **PAUSE/RESUME** buttons. On generation, messages are copied and verified one at a time in original order. Sessions support up to 200 messages. If Telegram temporarily rate-limits a save, use **GENERATE LINK** again to resume from the last verified message.
-- `/batch` — forward the first and then last message from a source channel. The bot checks the range (up to 200 message IDs), retrieves available messages in ascending message-ID order, and archives supported non-service messages. To keep channel history access and sharing permission explicit, the bot must be an administrator in the source channel. Use only a channel you own or have permission to republish.
-- `/admin` — open the admin panel.
-- `/users` — admin-only paginated list of registered users and total count.
-- `/broadcast` — reply to a message with `/broadcast`, confirm, and the bot copies it to registered users.
-- `/about`, `/help`, `/status`, `/cancel` — information, status, or cancellation.
+- `/start` — show the welcome text or retrieve the file/batch named by a deep-link payload. Force-subscription channels configured in the state are checked before delivery.
+- `/getlink` — start a private multi-message upload session. Send messages, then use **GENERATE LINK**, **PAUSE**, **RESUME**, or **CANCEL**. New multi-message links point to a verified ordered manifest, so unrelated archive messages between uploaded items are not included. Sessions are limited to 200 messages and are held in memory until link generation.
+- `/batch` — admin-only. Provide the first and last source-channel post by forwarding each post or sending its Telegram post link. The bot reads explicit message IDs in that bounded range, skips unavailable messages, archives successful copies, and creates a manifest-backed link. The source range is limited to 200 IDs. Use this only for content you own or have permission to republish.
+- `/admin` — show the available admin dashboard and basic counters.
+- `/status` — admin-only status and counters.
+- `/users` — admin-only registered-user count.
+- `/broadcast` — admin-only; reply to a message with `/broadcast` to copy it to registered users.
+- `/addadmin <numeric_user_id>` and `/deladmin <numeric_user_id>` — owner-only management of extra stored administrators. The owner and `ADMINS` environment IDs cannot be removed.
 
-Single-message links and ordered batch links use Telegram deep-link payloads. Batch links point to a manifest message in the archive channel containing the ordered archive message IDs.
+The admin dashboard's existing **Edit Welcome** action now stores a new text welcome message. **FSUB Settings** supports adding/removing up to 10 channels and editing the subscription prompt. The bot must be an administrator in every FSUB channel for membership checks. The **Broadcast** dashboard action explains the existing reply-and-command flow; the command currently sends immediately and does not ask for a second confirmation.
 
-## Admin panel
+The existing single-message deep-link payloads and old inclusive range-based batch payloads remain decodable. New batch links use the existing `?start=batch_...` entry point but refer to a small archive manifest containing the exact ordered archive message IDs. Legacy range links are bounded to 200 IDs; because an old range payload did not record an exact manifest, its IDs may include messages that were not part of the original batch if unrelated archive posts were interleaved.
 
-- Set the welcome message as text or a photo with caption.
-- Set the force-subscription prompt as text or a photo with caption.
-- Add/remove up to 10 force-subscription channels. Send an entry as `@channel-or-channel-id | https://t.me/invite-link | button label`. The bot must be an administrator in every force-subscription channel so it can check membership.
-- View users, link counts, basic bot statistics, and archive-channel information.
-- Add/remove extra admins (the owner and `ADMINS` environment IDs cannot be removed in the panel).
-- Pause/resume new upload sessions globally.
+## Telegram permissions and `/batch`
 
-The `/about` command uses the ANIFLIX credits and a Telegram blockquote style. It no longer shows the previous MD BOTZ / MD GROUP credits.
+Make the bot an administrator in the private archive channel with permission to post, edit, and pin messages. For `/batch`, the bot must be able to resolve the source channel and read the selected posts; make it an administrator in that source channel when using the bot account.
 
-## Persistence without MongoDB
+State initialization and persistence do **not** call `get_chat_history`. It uses the pinned state message and, when available, a locally cached explicit message ID. `/batch` requests only the user-specified message IDs; it does not scan arbitrary history.
 
-The archive channel is also used to persist the bot's small settings record and registered-user records as internal text messages. This is necessary because Render Free local storage is not durable across restarts. These internal records are stored in the same private archive channel as media and may be visible to that channel's administrators. Keep the archive channel private and limit access to trusted admins. Do not delete messages beginning with `ANIFLIX_STATE_V1:` or `ANIFLIX_USER_V1:`; the bot uses them to restore its settings and user list. The bot maintains only one current state record when possible; older copies are removed when it has permission.
+If Telegram returns `BOT_METHOD_INVALID` while `/batch` attempts to retrieve source posts using the bot account, set the optional `BATCH_USER_SESSION_STRING` to a separately authorized MTProto user session that can access that source channel. The bot starts this as a distinct read-only-in-purpose Pyrogram client for `/batch` source reads; archive writes and file delivery continue to use the bot account. Keep that session string private and enter it only in Render's secret environment-variable field. Do not commit it to Git or paste it into logs. This optional setting is not required for normal bot operation or state loading.
 
-## Important limitations
+## Persistence and Render Free
 
-- Telegram may reject copying protected, deleted, restricted, or otherwise non-copyable messages. The bot does not bypass those restrictions.
-- `/batch` requires the bot to be an administrator in the source channel and should only be used for content you own or have permission to republish.
-- A batch range may contain deleted message IDs or service messages. Those are skipped; the bot reports the number saved. Other supported messages are kept in original message-ID order.
-- The `/getlink` session queue is held in memory until link generation. An unfinished session may be lost if Render restarts before you generate its link. Messages already copied to the archive remain there.
-- Batch retrieval sends the archived messages one by one in order. Telegram does not necessarily recreate the original album grouping.
-- Links work only while the bot account, its username, archive channel, and referenced archive messages remain available.
-- The bot was tested locally with mocked Telegram operations. Test with a small, permitted sample before storing important messages; a live Telegram test still requires your own bot token and channel setup.
+Persistent settings are stored as a small text record in the archive channel's pinned message. The archive channel must remain private and limited to trusted administrators. If the bot cannot edit or pin the record, settings may not persist after a restart. The local `bot_state_data.json` file is only a cache: Render Free has ephemeral local storage, so it must not be treated as permanent storage. The state is stored in a single Telegram text message and is subject to Telegram's message-size limit; the bot logs an error rather than pretending an oversized state was saved remotely.
 
-## Render
+Render Free web services can spin down or restart. The `/health` endpoint and UptimeRobot can help with availability checks, but they do not provide guaranteed always-on bot polling or durable local storage. Use Free for testing/best-effort operation and choose an always-on deployment for reliable continuous polling.
 
-Keep the same environment variables as the Telegram-only build:
+## Render deployment
 
-```env
-BOT_TOKEN=your_bot_token
-API_ID=your_api_id
-API_HASH=your_api_hash
-OWNER_ID=your_telegram_user_id
-DB_CHANNEL=-1001234567890
-```
+1. Push the contents of this ZIP's project folder to a GitHub repository.
+2. In Render, choose **New + → Blueprint** and connect that repository, or create a Python Web Service from the repository.
+3. Use the repository's `render.yaml` settings, or enter:
+   - Build command: `pip install --no-cache-dir -r requirements.txt`
+   - Start command: `python main.py`
+   - Health check path: `/health`
+4. Set these required environment variables in Render:
+   - `BOT_TOKEN` — token from BotFather
+   - `API_ID` and `API_HASH` — Telegram API credentials
+   - `OWNER_ID` — your numeric Telegram user ID
+   - `DB_CHANNEL` — private archive channel ID in `-100…` form; despite the legacy name, this is not a database
+5. Optionally set `ADMINS` as comma-separated numeric Telegram user IDs and `PROTECT_CONTENT=true` or `false`.
+6. Leave `BATCH_USER_SESSION_STRING` blank unless `/batch` receives `BOT_METHOD_INVALID` for source message retrieval. If required, provide a separately authorized session securely through Render's environment settings.
+7. Add the bot as an administrator in the archive channel with posting, editing, and pinning permissions. For source retrieval in `/batch`, also add it as an administrator in the source channel unless using the optional reader session.
+8. Deploy, wait for the `/health` check to pass, then test `/getlink` with a few permitted messages. Test `/batch` only with a channel you control or have permission to republish.
 
-`DB_CHANNEL` is the Telegram archive channel ID; it is not a database. The existing build/start commands remain:
+Never add real tokens, API hashes, or session strings to `.env.example` or Git. `.env.example` contains variable names only. No live Telegram deployment test was performed as part of these local repairs.
+
+## Local checks
+
+Install declared dependencies and run:
 
 ```bash
-pip install --no-cache-dir -r requirements.txt
-python main.py
+pip install -r requirements.txt
+python -m compileall -q .
+python -m unittest discover -s tests -v
 ```
 
-## Apply this patch
+The tests use mocked Telegram operations; they do not claim live Telegram verification.
 
-1. Keep a backup of your current project.
-2. Extract this ZIP into the existing project root and allow it to replace matching files.
-3. Deploy the updated code.
-4. Make the bot an administrator in the archive channel and the channels you configure for force subscription.
-5. First test `/getlink` with a few text/photo messages, then `/batch` only with a channel you control or have permission to republish.
+## Scope note
+
+The uploaded source provided counters but not upload-history browsing, failed-upload tracking, or a detailed storage inventory; these are not claimed as working features. `/users` reports the registered-user count rather than a paginated user list. The bot also does not include a broadcast confirmation step. Existing deployments should first test configuration changes with a small permitted sample.

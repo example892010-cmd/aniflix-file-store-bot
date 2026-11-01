@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from aiohttp import web
 from pyrogram import idle
 from bot import bot, register_handlers
@@ -31,7 +32,6 @@ async def start_web_server():
 
 
 async def main():
-    import os
     # Start web server if PORT is set (Render Web Service)
     web_runner = None
     if os.environ.get("PORT"):
@@ -40,21 +40,23 @@ async def main():
     # Register any extra handlers if defined
     register_handlers(bot)
 
-    # Start Pyrogram Bot
-    await bot.start()
-    logger.info("Aniflix File Store Bot is fully online.")
+    started = False
+    try:
+        # Start Pyrogram Bot
+        await bot.start()
+        started = True
+        logger.info("Aniflix File Store Bot is fully online.")
 
-    # Keep running until terminated
-    await idle()
-
-    # Graceful shutdown
-    await bot.stop()
-    if web_runner:
-        await web_runner.cleanup()
+        # Keep running until terminated
+        await idle()
+    finally:
+        if started:
+            await bot.stop()
+        if web_runner:
+            await web_runner.cleanup()
 
 
 if __name__ == "__main__":
-    import os
     loop = asyncio.get_event_loop()
     try:
         loop.run_until_complete(main())
