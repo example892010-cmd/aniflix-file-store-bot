@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: aniflix-file-store-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: DB_CHANNEL
+        sync: false
+      - key: ADMINS
+        value: ""
+      - key: PROTECT_CONTENT
+        value: "true"
+      - key: BOT_DISPLAY_NAME
+        value: ANIFLIX FILE STORE BOT
+      - key: OWNER_CREDIT
+        value: "@TANJIROKAMADO404"
+      - key: DEVELOPER_CREDIT
+        value: "@TANJIROKAMADO404"
+      - key: UPDATES_URL
+        value: "https://t.me/+98iAagsDsjI5NDk1"
+      - key: ONGOING_URL
+        value: "https://t.me/+98iAagsDsjI5NDk1"
+      - key: SUPPORT_URL
+        value: "https://t.me/+1jDuhUQ41hA1YmVl"
