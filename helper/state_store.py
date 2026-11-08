@@ -14,6 +14,8 @@ DEFAULT_STATE: Dict[str, Any] = {
     "admins": [],
     "fsub_channels": [],
     "fsub_join_requests": {},
+    "fsub_joined_members": {},
+    "fsub_approved_requests": {},
     "fsub_message": None,
     "welcome_message": None,
     "stats": {
@@ -215,6 +217,47 @@ class StateStore:
             users.add(int(user_id))
             requests[key] = sorted(users)
             await self.save_state()
+
+    async def _record_fsub_user(self, state_key: str, channel_id: int, user_id: int) -> bool:
+        """Add one unique user to a per-channel set and persist only on change."""
+        mapping = self.state.setdefault(state_key, {})
+        key = str(int(channel_id))
+        users = {int(item) for item in mapping.get(key, [])}
+        uid = int(user_id)
+        if uid in users:
+            return False
+        users.add(uid)
+        mapping[key] = sorted(users)
+        await self.save_state()
+        return True
+
+    async def record_fsub_verified_join(self, channel_id: int, user_id: int):
+        """Record a real membership confirmed by Telegram for a normal-join channel."""
+        return await self._record_fsub_user("fsub_joined_members", channel_id, user_id)
+
+    async def record_fsub_request_approved(self, channel_id: int, user_id: int):
+        """Record approval only when this user previously submitted a recorded request."""
+        if not self.has_fsub_join_request(channel_id, user_id):
+            return False
+        return await self._record_fsub_user("fsub_approved_requests", channel_id, user_id)
+
+    def get_fsub_channel_stats(self, channel_id: int) -> Dict[str, int]:
+        """Return observed unique-user counts; never infer missing historical data."""
+        key = str(int(channel_id))
+        requests = self.state.get("fsub_join_requests", {})
+        approved = self.state.get("fsub_approved_requests", {})
+        joined = self.state.get("fsub_joined_members", {})
+        request_ids = {int(item) for item in requests.get(key, [])} if isinstance(requests, dict) else set()
+        approved_ids = {int(item) for item in approved.get(key, [])} if isinstance(approved, dict) else set()
+        joined_ids = {int(item) for item in joined.get(key, [])} if isinstance(joined, dict) else set()
+        # An approval must always be a subset of requests received by this bot.
+        approved_ids &= request_ids
+        return {
+            "joined": len(joined_ids),
+            "requests": len(request_ids),
+            "approved": len(approved_ids),
+            "pending": len(request_ids - approved_ids),
+        }
 
     async def record_user(self, user_id: int):
         users = set(self.state.get("users", []))
