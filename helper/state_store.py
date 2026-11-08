@@ -14,8 +14,8 @@ DEFAULT_STATE: Dict[str, Any] = {
     "admins": [],
     "fsub_channels": [],
     "fsub_join_requests": {},
-    "fsub_joined_members": {},
-    "fsub_approved_requests": {},
+    "fsub_stats": {},
+    "user_profiles": {},
     "fsub_message": None,
     "welcome_message": None,
     "stats": {
@@ -208,62 +208,71 @@ class StateStore:
         users = requests.get(str(int(channel_id)), []) if isinstance(requests, dict) else []
         return int(user_id) in {int(item) for item in users}
 
+    def _fsub_stat_users(self, channel_id: int, field: str) -> set:
+        stats = self.state.setdefault("fsub_stats", {})
+        channel_stats = stats.setdefault(str(int(channel_id)), {})
+        return {int(item) for item in channel_stats.get(field, [])}
+
     async def record_fsub_join_request(self, channel_id: int, user_id: int):
-        """Persist a confirmed join request; duplicate updates are idempotent."""
+        """Record the access-qualifying request and a separate unique statistics event."""
+        channel_id, user_id = int(channel_id), int(user_id)
+        key = str(channel_id)
         requests = self.state.setdefault("fsub_join_requests", {})
-        key = str(int(channel_id))
-        users = {int(item) for item in requests.get(key, [])}
-        if int(user_id) not in users:
-            users.add(int(user_id))
-            requests[key] = sorted(users)
+        access_users = {int(item) for item in requests.get(key, [])}
+        changed = False
+        if user_id not in access_users:
+            access_users.add(user_id)
+            requests[key] = sorted(access_users)
+            changed = True
+
+        stat_users = self._fsub_stat_users(channel_id, "requests")
+        if user_id not in stat_users:
+            stat_users.add(user_id)
+            self.state.setdefault("fsub_stats", {}).setdefault(key, {})["requests"] = sorted(stat_users)
+            changed = True
+        if changed:
             await self.save_state()
 
-    async def _record_fsub_user(self, state_key: str, channel_id: int, user_id: int) -> bool:
-        """Add one unique user to a per-channel set and persist only on change."""
-        mapping = self.state.setdefault(state_key, {})
-        key = str(int(channel_id))
-        users = {int(item) for item in mapping.get(key, [])}
-        uid = int(user_id)
-        if uid in users:
-            return False
-        users.add(uid)
-        mapping[key] = sorted(users)
-        await self.save_state()
-        return True
-
-    async def record_fsub_verified_join(self, channel_id: int, user_id: int):
-        """Record a real membership confirmed by Telegram for a normal-join channel."""
-        return await self._record_fsub_user("fsub_joined_members", channel_id, user_id)
-
-    async def record_fsub_request_approved(self, channel_id: int, user_id: int):
-        """Record approval only when this user previously submitted a recorded request."""
-        if not self.has_fsub_join_request(channel_id, user_id):
-            return False
-        return await self._record_fsub_user("fsub_approved_requests", channel_id, user_id)
-
-    def get_fsub_channel_stats(self, channel_id: int) -> Dict[str, int]:
-        """Return observed unique-user counts; never infer missing historical data."""
-        key = str(int(channel_id))
-        requests = self.state.get("fsub_join_requests", {})
-        approved = self.state.get("fsub_approved_requests", {})
-        joined = self.state.get("fsub_joined_members", {})
-        request_ids = {int(item) for item in requests.get(key, [])} if isinstance(requests, dict) else set()
-        approved_ids = {int(item) for item in approved.get(key, [])} if isinstance(approved, dict) else set()
-        joined_ids = {int(item) for item in joined.get(key, [])} if isinstance(joined, dict) else set()
-        # An approval must always be a subset of requests received by this bot.
-        approved_ids &= request_ids
-        return {
-            "joined": len(joined_ids),
-            "requests": len(request_ids),
-            "approved": len(approved_ids),
-            "pending": len(request_ids - approved_ids),
-        }
-
-    async def record_user(self, user_id: int):
-        users = set(self.state.get("users", []))
+    async def record_fsub_member(self, channel_id: int, user_id: int, *, accepted: bool = False):
+        """Record a Telegram-confirmed member; accepted is for previously recorded requests."""
+        channel_id, user_id = int(channel_id), int(user_id)
+        key = str(channel_id)
+        channel_stats = self.state.setdefault("fsub_stats", {}).setdefault(key, {})
+        field = "accepted" if accepted else "joined"
+        users = {int(item) for item in channel_stats.get(field, [])}
         if user_id not in users:
             users.add(user_id)
-            self.state["users"] = list(users)
+            channel_stats[field] = sorted(users)
+            await self.save_state()
+
+    def get_fsub_counts(self, channel_id: int) -> Dict[str, int]:
+        key = str(int(channel_id))
+        channel_stats = self.state.get("fsub_stats", {}).get(key, {})
+        return {
+            "joined": len(set(channel_stats.get("joined", []))),
+            "requests": len(set(channel_stats.get("requests", []))),
+            "accepted": len(set(channel_stats.get("accepted", []))),
+        }
+
+    async def clear_fsub_counts(self, channel_id: int):
+        """Clear display statistics only; preserve join-request access records."""
+        self.state.setdefault("fsub_stats", {}).pop(str(int(channel_id)), None)
+        await self.save_state()
+
+    async def record_user(self, user_id: int, first_name: str = "", last_name: str = "", username: str = ""):
+        user_id = int(user_id)
+        users = {int(item) for item in self.state.get("users", [])}
+        is_new = user_id not in users
+        users.add(user_id)
+        self.state["users"] = sorted(users)
+        profiles = self.state.setdefault("user_profiles", {})
+        profile = {
+            "first_name": str(first_name or ""),
+            "last_name": str(last_name or ""),
+            "username": str(username or ""),
+        }
+        if profiles.get(str(user_id)) != profile or is_new:
+            profiles[str(user_id)] = profile
             stats = self.state.setdefault("stats", dict(DEFAULT_STATE["stats"]))
             stats["total_users"] = len(users)
             await self.save_state()
