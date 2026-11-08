@@ -144,6 +144,38 @@ async def record_fsub_join_request(client: Client, request):
     except Exception:
         logger.exception("Could not record incoming FSUB join request")
 
+@bot.on_chat_member_updated()
+async def record_fsub_membership_update(client: Client, update):
+    """Track actual joins and approvals from Telegram membership updates."""
+    try:
+        channel_id = int(update.chat.id)
+        new_member = getattr(update, "new_chat_member", None)
+        old_member = getattr(update, "old_chat_member", None)
+        affected_user = getattr(new_member, "user", None)
+        if not affected_user:
+            return
+        user_id = int(affected_user.id)
+        if not _is_joined_member(new_member):
+            return
+        was_member = _is_joined_member(old_member) if old_member else False
+        if was_member:
+            return
+
+        for channel in bot.state_store.get_fsub_channels():
+            if int(channel.get("id") or 0) != channel_id:
+                continue
+            is_request_channel = bool(
+                channel.get("join_request") or channel.get("type") == "join_request"
+            )
+            if is_request_channel:
+                # A user counts as approved only if their request was recorded first.
+                await bot.state_store.record_fsub_request_approved(channel_id, user_id)
+            else:
+                await bot.state_store.record_fsub_verified_join(channel_id, user_id)
+            return
+    except Exception:
+        logger.exception("Could not record FSUB membership update")
+
 
 # ------------------- HELPER FUNCTIONS ------------------- #
 
@@ -207,18 +239,31 @@ async def check_fsub(client: Client, user_id: int) -> List[Dict]:
     unjoined = []
     for ch in fsub_channels:
         chat_identifier = ch.get("id") or ch.get("username")
+        channel_id = int(ch.get("id") or 0)
         is_request_channel = bool(ch.get("join_request") or ch.get("type") == "join_request")
-        if is_request_channel and bot.state_store.has_fsub_join_request(int(ch.get("id") or 0), user_id):
-            continue
+        has_recorded_request = is_request_channel and bot.state_store.has_fsub_join_request(channel_id, user_id)
         try:
             member = await client.get_chat_member(chat_identifier, user_id)
-            if not _is_joined_member(member):
+            if _is_joined_member(member):
+                if is_request_channel and has_recorded_request:
+                    # Count approval only after Telegram confirms actual membership.
+                    await bot.state_store.record_fsub_request_approved(channel_id, user_id)
+                elif not is_request_channel:
+                    await bot.state_store.record_fsub_verified_join(channel_id, user_id)
+                if has_recorded_request:
+                    # Existing policy: a recorded request satisfies FSUB while pending.
+                    continue
+            elif has_recorded_request:
+                continue
+            else:
                 unjoined.append(ch)
         except UserNotParticipant:
-            unjoined.append(ch)
+            if not has_recorded_request:
+                unjoined.append(ch)
         except Exception as e:
             logger.warning("FSUB membership check failed for %s: %s", chat_identifier, e)
-            unjoined.append(ch)
+            if not has_recorded_request:
+                unjoined.append(ch)
     return unjoined
 
 
@@ -964,16 +1009,26 @@ async def callback_router(client: Client, query: CallbackQuery):
         ADMIN_PENDING_DATA.pop(user_id, None)
         await query.answer()
         channels = bot.state_store.get_fsub_channels()
-        ch_list = "\n".join(
-            [
-                f"{index}. **{channel.get('name', 'Channel')}** "
-                f"(`{channel.get('id') or channel.get('username')}`) — "
-                f"{'JOIN REQUEST' if channel.get('join_request') or channel.get('type') == 'join_request' else 'NORMAL JOIN'}"
-                for index, channel in enumerate(channels, start=1)
-            ]
-        ) if channels else "No force-subscription channels added yet."
+        channel_lines = []
+        for index, channel in enumerate(channels, start=1):
+            channel_id = int(channel.get("id") or 0)
+            is_request = bool(channel.get("join_request") or channel.get("type") == "join_request")
+            counts = bot.state_store.get_fsub_channel_stats(channel_id)
+            method = "JOIN REQUEST" if is_request else "NORMAL JOIN"
+            channel_lines.append(
+                f"{index}. **{channel.get('name', 'Channel')}** (`{channel_id or channel.get('username')}`)\n"
+                f"   Method: **{method}**\n"
+                + (
+                    f"   📨 Requests received: `{counts['requests']}`\n"
+                    f"   ✅ Accepted (membership confirmed): `{counts['approved']}`"
+                    if is_request else
+                    f"   👥 Verified joins tracked: `{counts['joined']}`"
+                )
+            )
+        ch_list = "\n\n".join(channel_lines) if channel_lines else "No force-subscription channels added yet."
         await query.message.edit_text(
-            f"📢 **Force Subscribe Channels (Max 10)**:\n\n{ch_list}",
+            f"📢 **Force Subscribe Channels (Max 10)**\n\n{ch_list}\n\n"
+            "ℹ️ Counts include only unique users actually observed by the bot. Accepted means Telegram confirmed membership after a recorded request. Older activity that was never recorded cannot be reconstructed. Declined/withdrawn requests are not labelled as pending because Telegram does not provide a reliable historical pending total.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("➕ Add Channel", callback_data="adm_fsub_add"),
                  InlineKeyboardButton("➖ Remove Channel", callback_data="adm_fsub_remove")],
