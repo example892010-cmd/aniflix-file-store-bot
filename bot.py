@@ -55,10 +55,6 @@ def _get_admins() -> List[int]:
     return list(bot.settings.admins)
 
 
-def _get_fsub_channels() -> List[Dict]:
-    return getattr(config, "FSUB_CHANNELS", [])
-
-
 class AniflixBot(Client):
     def __init__(self, settings=None):
         self.settings = settings or config.load_settings()
@@ -230,9 +226,10 @@ async def check_fsub(client: Client, user_id: int) -> List[Dict]:
     request through this bot-created invite link is sufficient. The request is
     persisted, so a restart does not make the user submit it again.
     """
+    # The persisted admin-managed list is authoritative. In particular, an
+    # empty list means FSUB is disabled; never resurrect removed channels from
+    # legacy config defaults.
     fsub_channels = bot.state_store.get_fsub_channels()
-    if not fsub_channels:
-        fsub_channels = _get_fsub_channels()
 
     unjoined = []
     for ch in fsub_channels:
@@ -749,8 +746,8 @@ async def incoming_private_messages(client: Client, message: Message):
             index = int(value) - 1
             if index < 0 or index >= len(channels):
                 return await message.reply_text("⚠️ No FSUB channel has that number.")
-            channels.pop(index)
-            await bot.state_store.set_fsub_channels(channels)
+            removed_channel = channels[index]
+            await bot.state_store.remove_fsub_channel(int(removed_channel.get("id") or 0))
             ADMIN_PENDING_ACTIONS.pop(user_id, None)
             ADMIN_PENDING_DATA.pop(user_id, None)
             return await message.reply_text("✅ FSUB channel removed.")
