@@ -31,6 +31,7 @@ from helper.storage import (
     deliver_archived_batch,
     save_batch_manifest,
 )
+from helper.upload_order import ordered_archive_message_ids, sort_upload_messages
 
 logging.basicConfig(
     level=logging.INFO,
@@ -442,23 +443,27 @@ bot.on_message(filters.command("start") & filters.private)(start_handler)
 @bot.on_message(filters.command("getlink") & filters.private)
 async def getlink_handler(client: Client, message: Message):
     user_id = message.from_user.id
-    USER_UPLOAD_SESSIONS[user_id] = {
-        "status": "recording",
-        "message_ids": []
-    }
-
     buttons = [
         [InlineKeyboardButton("✅ GENERATE LINK", callback_data="gen_link_finish")],
         [InlineKeyboardButton("⏸ PAUSE", callback_data="gen_link_pause"),
          InlineKeyboardButton("❌ CANCEL", callback_data="gen_link_cancel")]
     ]
-    await message.reply_text(
+    control_message = await message.reply_text(
         "📥 **Multi-Message Upload Session Started**\n\n"
-        "Forward or send any files, videos, documents, or photos.\n"
-        "Current Stored Count: **0**\n\n"
-        "Tap **GENERATE LINK** when finished.",
+        "Forward all the messages/files together. I will keep their original order.\n"
+        "Queued: **0**\n\n"
+        "Tap **GENERATE LINK** after forwarding is complete.",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
+    USER_UPLOAD_SESSIONS[user_id] = {
+        "status": "recording",
+        "source_messages": {},
+        "archived": {},
+        "message_ids": [],
+        "control_message": control_message,
+        "status_lock": asyncio.Lock(),
+        "finish_lock": asyncio.Lock(),
+    }
 
 
 # ------------------- COMMAND: /BATCH ------------------- #
@@ -860,36 +865,51 @@ async def incoming_private_messages(client: Client, message: Message):
                 f"• Link: {batch_url}"
             )
 
-    # Handle /getlink upload session, including a true paused state.
+    # Handle /getlink upload sessions. Buffer first, then archive in source-chat
+    # message-ID order when the user generates the link. This prevents parallel
+    # Pyrogram handlers from changing the order of a multi-message forward.
     if user_id in USER_UPLOAD_SESSIONS:
         session = USER_UPLOAD_SESSIONS[user_id]
         if session.get("status") == "paused":
             return await message.reply_text("⏸ This upload session is paused. Tap RESUME or CANCEL before sending more files.")
         if session.get("status") != "recording":
             return
-        if len(session.get("message_ids", [])) >= MAX_BATCH_MESSAGES:
+
+        source_messages = session.setdefault("source_messages", {})
+        source_message_id = int(getattr(message, "id", 0) or 0)
+        if source_message_id <= 0:
+            return await message.reply_text("❌ I could not identify this message. Please forward it again.")
+        if source_message_id not in source_messages and len(source_messages) >= MAX_BATCH_MESSAGES:
             return await message.reply_text(
                 f"⚠️ Upload sessions are limited to {MAX_BATCH_MESSAGES} messages. Generate this link or cancel the session."
             )
-        try:
-            copied = await bot.file_storage.store_message(message)
-        except Exception as exc:
-            logger.exception("Could not archive upload-session message")
-            return await message.reply_text(f"❌ File could not be stored: `{exc}`")
-        if not copied:
-            return await message.reply_text("❌ File could not be verified in the archive. Please retry.")
-        session["message_ids"].append(copied.id)
-        count = len(USER_UPLOAD_SESSIONS[user_id]["message_ids"])
 
+        source_messages[source_message_id] = message
+        count = len(source_messages)
         buttons = [
             [InlineKeyboardButton("✅ GENERATE LINK", callback_data="gen_link_finish")],
             [InlineKeyboardButton("⏸ PAUSE", callback_data="gen_link_pause"),
              InlineKeyboardButton("❌ CANCEL", callback_data="gen_link_cancel")]
         ]
-        return await message.reply_text(
-            f"✅ File received!\nTotal queued: **{count}**",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
+        control_message = session.get("control_message")
+        status_lock = session.get("status_lock")
+        if control_message and status_lock:
+            try:
+                async with status_lock:
+                    if USER_UPLOAD_SESSIONS.get(user_id) is session and session.get("status") == "recording":
+                        current_count = len(session.get("source_messages", {}))
+                        await control_message.edit_text(
+                            "📥 **Multi-Message Upload Session**\n\n"
+                            "✅ Messages queued in original send order.\n"
+                            f"Queued: **{current_count}**\n\n"
+                            "Tap **GENERATE LINK** after forwarding is complete.",
+                            reply_markup=InlineKeyboardMarkup(buttons)
+                        )
+            except MessageNotModified:
+                pass
+            except Exception as exc:
+                logger.warning("Could not update /getlink queue status: %s", exc)
+        return
 
     # Single-file direct upload
     if message.media or message.document:
@@ -928,32 +948,76 @@ async def callback_router(client: Client, query: CallbackQuery):
 
     if data == "gen_link_finish":
         session = USER_UPLOAD_SESSIONS.get(user_id)
-        if not session or not session.get("message_ids"):
-            return await query.answer("No files uploaded yet!", show_alert=True)
+        if not session or not session.get("source_messages"):
+            return await query.answer("No messages received yet!", show_alert=True)
 
-        mids = session["message_ids"]
-        try:
-            if len(mids) == 1:
-                code = encode_message_id(mids[0])
-                url = f"https://t.me/{bot.username}?start={code}"
-            else:
-                manifest_id = await save_batch_manifest(bot, bot.archive_channel_id, mids)
-                code = encode_batch_manifest_id(manifest_id)
-                url = f"https://t.me/{bot.username}?start=batch_{code}"
-        except Exception:
-            logger.exception("Could not create upload-session link")
-            return await query.answer("Could not save the link manifest. Your upload session is still available; try again.", show_alert=True)
+        finish_lock = session.setdefault("finish_lock", asyncio.Lock())
+        async with finish_lock:
+            if USER_UPLOAD_SESSIONS.get(user_id) is not session:
+                return await query.answer("This upload session has already finished.", show_alert=True)
 
-        del USER_UPLOAD_SESSIONS[user_id]
-        await bot.state_store.update_stats(total_links=1, total_files=len(mids))
-        await query.message.edit_text(
-            f"🎉 **Batch Generated!**\n\n"
-            f"• Count: `{len(mids)}` messages\n"
-            f"• Shareable Link: {url}"
-        )
+            session["status"] = "processing"
+            source_messages = sort_upload_messages(session.get("source_messages", {}).values())
+            archived_by_source_id = session.setdefault("archived", {})
+            failed_ids = []
+
+            # Archive sequentially in the original private-chat message order.
+            for source_message in source_messages:
+                source_id = int(source_message.id)
+                if source_id in archived_by_source_id:
+                    continue
+                try:
+                    copied = await bot.file_storage.store_message(source_message)
+                    if not copied:
+                        raise RuntimeError("Archive copy could not be verified")
+                    archived_by_source_id[source_id] = int(copied.id)
+                except Exception:
+                    logger.exception("Could not archive /getlink source message %s", source_id)
+                    failed_ids.append(source_id)
+
+            if failed_ids:
+                session["status"] = "recording"
+                return await query.answer(
+                    f"{len(failed_ids)} message(s) could not be saved. Please tap GENERATE LINK to retry.",
+                    show_alert=True,
+                )
+
+            mids = ordered_archive_message_ids(archived_by_source_id)
+            if not mids:
+                session["status"] = "recording"
+                return await query.answer("No files were successfully saved.", show_alert=True)
+
+            try:
+                if len(mids) == 1:
+                    code = encode_message_id(mids[0])
+                    url = f"https://t.me/{bot.username}?start={code}"
+                else:
+                    manifest_id = await save_batch_manifest(bot, bot.archive_channel_id, mids)
+                    code = encode_batch_manifest_id(manifest_id)
+                    url = f"https://t.me/{bot.username}?start=batch_{code}"
+            except Exception:
+                session["status"] = "recording"
+                logger.exception("Could not create upload-session link")
+                return await query.answer(
+                    "Could not save the link manifest. Your queued messages are safe; tap GENERATE LINK to retry.",
+                    show_alert=True,
+                )
+
+            session["message_ids"] = mids
+            del USER_UPLOAD_SESSIONS[user_id]
+            await bot.state_store.update_stats(total_links=1, total_files=len(mids))
+            await query.answer("Ordered batch link generated successfully!")
+            await query.message.edit_text(
+                f"🎉 **Batch Generated Successfully!**\n\n"
+                f"• Count: `{len(mids)}` messages\n"
+                f"• Order: **Preserved**\n"
+                f"• Shareable Link: {url}"
+            )
 
     elif data == "gen_link_pause":
         session = USER_UPLOAD_SESSIONS.get(user_id)
+        if session and session.get("status") == "processing":
+            return await query.answer("The batch is being saved. Please wait for it to finish.", show_alert=True)
         if session:
             session["status"] = "paused"
             await query.answer("Upload session paused.")
@@ -966,6 +1030,8 @@ async def callback_router(client: Client, query: CallbackQuery):
 
     elif data == "gen_link_resume":
         session = USER_UPLOAD_SESSIONS.get(user_id)
+        if session and session.get("status") == "processing":
+            return await query.answer("The batch is being saved. Please wait for it to finish.", show_alert=True)
         if session:
             session["status"] = "recording"
             await query.answer("Upload session resumed.")
@@ -977,8 +1043,12 @@ async def callback_router(client: Client, query: CallbackQuery):
             await query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(buttons))
 
     elif data == "gen_link_cancel":
-        if user_id in USER_UPLOAD_SESSIONS:
+        session = USER_UPLOAD_SESSIONS.get(user_id)
+        if session and session.get("status") == "processing":
+            return await query.answer("The batch is being saved. Please wait for it to finish.", show_alert=True)
+        if session:
             del USER_UPLOAD_SESSIONS[user_id]
+        await query.answer("Upload session cancelled.")
         await query.message.edit_text("❌ Upload session cancelled.")
 
     elif data == "adm_status":
