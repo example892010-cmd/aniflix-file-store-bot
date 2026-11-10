@@ -202,6 +202,21 @@ class StateStore:
         self.state["fsub_channels"] = channels[:10]
         await self.save_state()
 
+    async def remove_fsub_channel(self, channel_id: int):
+        """Remove a channel from FSUB and erase its channel-specific records.
+
+        Old join-request records must not unlock access if the same channel is
+        added again later. Statistics for a removed channel are removed too.
+        """
+        key = str(int(channel_id))
+        self.state["fsub_channels"] = [
+            channel for channel in self.state.get("fsub_channels", [])
+            if int(channel.get("id") or 0) != int(channel_id)
+        ]
+        self.state.setdefault("fsub_join_requests", {}).pop(key, None)
+        self.state.setdefault("fsub_stats", {}).pop(key, None)
+        await self.save_state()
+
     def has_fsub_join_request(self, channel_id: int, user_id: int) -> bool:
         """Whether Telegram has confirmed this user's request for this channel."""
         requests = self.state.get("fsub_join_requests", {})
