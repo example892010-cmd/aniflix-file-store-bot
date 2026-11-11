@@ -15,7 +15,7 @@ class Settings:
     archive_channel_id: int
     admins: tuple[int, ...]
     port: int = 10000
-    protect_content: bool = True
+    protect_content: bool = False
     bot_display_name: str = "ANIFLIX FILE STORE BOT"
     owner_credit: str = "@TANJIROKAMADO404"
     developer_credit: str = "@TANJIROKAMADO404"
@@ -91,7 +91,8 @@ def load_settings(source: dict[str, str] | None = None) -> Settings:
         archive_channel_id=archive_channel_id,
         admins=tuple(sorted(admins)),
         port=port,
-        protect_content=_boolean(env.get("PROTECT_CONTENT"), True),
+        # Content protection is intentionally disabled so recipients can forward files.
+        protect_content=False,
         bot_display_name=env.get("BOT_DISPLAY_NAME", "ANIFLIX FILE STORE BOT").strip() or "ANIFLIX FILE STORE BOT",
         owner_credit=env.get("OWNER_CREDIT", "@TANJIROKAMADO404").strip(),
         developer_credit=env.get("DEVELOPER_CREDIT", "@TANJIROKAMADO404").strip(),
