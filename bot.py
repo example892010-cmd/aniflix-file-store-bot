@@ -283,7 +283,7 @@ async def _deliver_start_payload(client: Client, user_id: int, message: Message,
                     bot.archive_channel_id,
                     manifest_id,
                     user_id,
-                    bot.settings.protect_content,
+                    False,  # Always allow recipients to forward/save delivered files.
                 )
                 await bot.state_store.update_stats(total_views=1)
                 if sent_count == 0:
@@ -302,7 +302,7 @@ async def _deliver_start_payload(client: Client, user_id: int, message: Message,
             sent_count = failed_count = 0
             for message_id in range(start_id, end_id + 1):
                 if await bot.file_storage.deliver_message(
-                    user_id, message_id, bot.settings.protect_content
+                    user_id, message_id, False  # Never apply Telegram content protection.
                 ):
                     sent_count += 1
                 else:
@@ -319,7 +319,7 @@ async def _deliver_start_payload(client: Client, user_id: int, message: Message,
 
         message_id = decode_message_id(param)
         if not await bot.file_storage.deliver_message(
-            user_id, message_id, bot.settings.protect_content
+            user_id, message_id, False  # Never apply Telegram content protection.
         ):
             return await message.reply_text("❌ This file is no longer available in the archive.")
         await bot.state_store.update_stats(total_views=1)
