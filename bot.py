@@ -66,9 +66,9 @@ class AniflixBot(Client):
             workers=8
         )
         self.archive_channel_id = self.settings.archive_channel_id
-        self.state_store = StateStore(self, self.archive_channel_id)
+        self.state_store = StateStore(self, self.archive_channel_id, self.settings.sqlite_path)
         # Keep Pyrogram Client.storage reserved for its internal MTProto session backend.
-        self.file_storage = Storage(self, self.archive_channel_id)
+        self.file_storage = Storage(self, self.archive_channel_id, self.state_store.database)
         self.batch_reader = None
         if self.settings.batch_user_session_string:
             # Optional user authorization is isolated to /batch source reads.
@@ -104,6 +104,7 @@ class AniflixBot(Client):
         if self.batch_reader and self.batch_reader.is_connected:
             await self.batch_reader.stop()
         await super().stop(*args)
+        self.state_store.close()
         logger.info("Bot stopped cleanly.")
 
 
@@ -120,9 +121,9 @@ async def record_fsub_membership_update(client: Client, update):
         user = getattr(new_member, "user", None)
         if not user:
             return
-        old_status = _member_status_name(old_member) if old_member else "LEFT"
-        new_status = _member_status_name(new_member)
-        became_member = new_status in {"MEMBER", "ADMINISTRATOR", "OWNER"} and old_status not in {"MEMBER", "ADMINISTRATOR", "OWNER"}
+        became_member = _is_joined_member(new_member) and not (
+            _is_joined_member(old_member) if old_member else False
+        )
         if not became_member:
             return
         for channel in bot.state_store.get_fsub_channels():
@@ -190,8 +191,14 @@ def _member_status_name(member) -> str:
 
 
 def _is_joined_member(member) -> bool:
-    # A pending join request is NOT membership and must never unlock a file.
-    return _member_status_name(member) in {"MEMBER", "ADMINISTRATOR", "OWNER"}
+    # Pending requests are not membership. Restricted users count only if Telegram
+    # explicitly reports is_member=True.
+    status = _member_status_name(member)
+    if status in {"MEMBER", "ADMINISTRATOR", "OWNER", "CREATOR"}:
+        return True
+    if status == "RESTRICTED":
+        return bool(getattr(member, "is_member", False))
+    return False
 
 
 def _forwarded_channel(message: Message):
@@ -221,10 +228,9 @@ async def _verify_bot_can_manage_invites(client: Client, channel_id: int):
 async def check_fsub(client: Client, user_id: int) -> List[Dict]:
     """Return channels still required for FSUB verification.
 
-    Normal-join channels require actual membership. For a join-request channel,
-    a successfully received Telegram chat_join_request update for this user's
-    request through this bot-created invite link is sufficient. The request is
-    persisted, so a restart does not make the user submit it again.
+    Normal-join and join-request channels both require confirmed Telegram
+    membership. A recorded join request is pending evidence only and never
+    grants access before an administrator accepts it.
     """
     # The persisted admin-managed list is authoritative. In particular, an
     # empty list means FSUB is disabled; never resurrect removed channels from
@@ -235,26 +241,79 @@ async def check_fsub(client: Client, user_id: int) -> List[Dict]:
     for ch in fsub_channels:
         chat_identifier = ch.get("id") or ch.get("username")
         is_request_channel = bool(ch.get("join_request") or ch.get("type") == "join_request")
-        has_request = is_request_channel and bot.state_store.has_fsub_join_request(int(ch.get("id") or 0), user_id)
+        has_request = is_request_channel and bot.state_store.has_fsub_join_request(
+            int(ch.get("id") or 0), user_id
+        )
         try:
             member = await client.get_chat_member(chat_identifier, user_id)
             if not _is_joined_member(member):
-                if not has_request:
-                    unjoined.append(ch)
-                # A recorded request still satisfies FSUB while approval is pending.
-            else:
-                if is_request_channel and has_request:
-                    await bot.state_store.record_fsub_member(int(ch.get("id") or 0), user_id, accepted=True)
-                elif not is_request_channel:
-                    await bot.state_store.record_fsub_member(int(ch.get("id") or 0), user_id)
-        except UserNotParticipant:
-            if not has_request:
                 unjoined.append(ch)
+            elif is_request_channel and has_request:
+                await bot.state_store.record_fsub_member(
+                    int(ch.get("id") or 0), user_id, accepted=True
+                )
+            elif not is_request_channel:
+                await bot.state_store.record_fsub_member(int(ch.get("id") or 0), user_id)
+        except UserNotParticipant:
+            unjoined.append(ch)
         except Exception as e:
             logger.warning("FSUB membership check failed for %s: %s", chat_identifier, e)
-            if not has_request:
-                unjoined.append(ch)
+            unjoined.append(ch)
     return unjoined
+
+
+async def _refresh_fsub_request_stats(client: Client, channel: Dict) -> None:
+    """Reconcile saved requests with Telegram's current pending-request list.
+
+    A request no longer pending and not a confirmed member is counted as closed
+    (declined or withdrawn); Telegram does not expose which of those occurred.
+    This is read-only: the bot never approves or declines requests.
+    """
+    channel_id = int(channel.get("id") or 0)
+    if not channel_id or not hasattr(client, "get_chat_join_requests"):
+        return
+    try:
+        pending_ids = set()
+        pending_iter = client.get_chat_join_requests(channel_id)
+        if hasattr(pending_iter, "__aiter__"):
+            async for joiner in pending_iter:
+                user = getattr(joiner, "user", None)
+                if user and getattr(user, "id", None):
+                    pending_ids.add(int(user.id))
+        else:
+            for joiner in pending_iter:
+                user = getattr(joiner, "user", None)
+                if user and getattr(user, "id", None):
+                    pending_ids.add(int(user.id))
+    except Exception as exc:
+        logger.warning("Could not refresh pending FSUB requests for %s: %s", channel_id, exc)
+        return
+
+    saved_requests = bot.state_store.get("fsub_join_requests", {}).get(str(channel_id), [])
+    for requested_user_id in saved_requests:
+        requested_user_id = int(requested_user_id)
+        if requested_user_id in pending_ids:
+            await bot.state_store.record_fsub_pending(channel_id, requested_user_id)
+            continue
+        try:
+            member = await client.get_chat_member(channel_id, requested_user_id)
+            if _is_joined_member(member):
+                await bot.state_store.record_fsub_member(
+                    channel_id, requested_user_id, accepted=True
+                )
+            else:
+                await bot.state_store.record_fsub_rejected_or_withdrawn(
+                    channel_id, requested_user_id
+                )
+        except UserNotParticipant:
+            await bot.state_store.record_fsub_rejected_or_withdrawn(
+                channel_id, requested_user_id
+            )
+        except Exception as exc:
+            logger.debug(
+                "Could not resolve FSUB request status for channel=%s user=%s: %s",
+                channel_id, requested_user_id, exc
+            )
 
 
 def get_fsub_keyboard(unjoined: List[Dict], redirect_data: Optional[str] = None) -> InlineKeyboardMarkup:
@@ -283,7 +342,7 @@ async def _deliver_start_payload(client: Client, user_id: int, message: Message,
                     bot.archive_channel_id,
                     manifest_id,
                     user_id,
-                    False,  # Always allow recipients to forward/save delivered files.
+                    bot.settings.protect_content,
                 )
                 await bot.state_store.update_stats(total_views=1)
                 if sent_count == 0:
@@ -302,7 +361,7 @@ async def _deliver_start_payload(client: Client, user_id: int, message: Message,
             sent_count = failed_count = 0
             for message_id in range(start_id, end_id + 1):
                 if await bot.file_storage.deliver_message(
-                    user_id, message_id, False  # Never apply Telegram content protection.
+                    user_id, message_id, bot.settings.protect_content
                 ):
                     sent_count += 1
                 else:
@@ -319,7 +378,7 @@ async def _deliver_start_payload(client: Client, user_id: int, message: Message,
 
         message_id = decode_message_id(param)
         if not await bot.file_storage.deliver_message(
-            user_id, message_id, False  # Never apply Telegram content protection.
+            user_id, message_id, bot.settings.protect_content
         ):
             return await message.reply_text("❌ This file is no longer available in the archive.")
         await bot.state_store.update_stats(total_views=1)
@@ -440,6 +499,10 @@ bot.on_message(filters.command("start") & filters.private)(start_handler)
 @bot.on_message(filters.command("getlink") & filters.private)
 async def getlink_handler(client: Client, message: Message):
     user_id = message.from_user.id
+    if user_id in USER_UPLOAD_SESSIONS:
+        return await message.reply_text(
+            "⚠️ You already have an upload session. Finish, resume, or cancel it first."
+        )
     buttons = [
         [InlineKeyboardButton("✅ GENERATE LINK", callback_data="gen_link_finish")],
         [InlineKeyboardButton("⏸ PAUSE", callback_data="gen_link_pause"),
@@ -706,6 +769,39 @@ async def incoming_private_messages(client: Client, message: Message):
                 "Please choose JOIN REQUEST or NORMAL JOIN using the buttons above, or /cancel."
             )
 
+        if action == "fsub_edit_select":
+            if not message.text or not message.text.strip().isdigit():
+                return await message.reply_text("Send the channel number from the list, or /cancel.")
+            channels = list(bot.state_store.get_fsub_channels())
+            index = int(message.text.strip()) - 1
+            if index < 0 or index >= len(channels):
+                return await message.reply_text("No FSUB channel has that number.")
+            selected = channels[index]
+            ADMIN_PENDING_DATA[user_id] = {"fsub_edit_channel_id": int(selected.get("id") or 0)}
+            ADMIN_PENDING_ACTIONS[user_id] = "fsub_edit_name"
+            return await message.reply_text(
+                f"Send the new display name for **{selected.get('name', 'Channel')}** "
+                "(maximum 100 characters), or /cancel."
+            )
+
+        if action == "fsub_edit_name":
+            new_name = (message.text or "").strip()
+            pending = ADMIN_PENDING_DATA.get(user_id, {})
+            channel_id = int(pending.get("fsub_edit_channel_id") or 0)
+            if not new_name or len(new_name) > 100:
+                return await message.reply_text("Send a display name between 1 and 100 characters.")
+            channels = list(bot.state_store.get_fsub_channels())
+            selected = next((item for item in channels if int(item.get("id") or 0) == channel_id), None)
+            if not selected:
+                ADMIN_PENDING_ACTIONS.pop(user_id, None)
+                ADMIN_PENDING_DATA.pop(user_id, None)
+                return await message.reply_text("That FSUB channel is no longer configured.")
+            selected["name"] = new_name
+            await bot.state_store.set_fsub_channels(channels)
+            ADMIN_PENDING_ACTIONS.pop(user_id, None)
+            ADMIN_PENDING_DATA.pop(user_id, None)
+            return await message.reply_text("✅ FSUB channel display name updated.")
+
         value = _admin_message_payload(message)
         if value is None:
             return await message.reply_text(
@@ -822,7 +918,8 @@ async def incoming_private_messages(client: Client, message: Message):
                         "Make sure the source channel is public or the bot is an administrator there."
                     )
 
-                for src_msg in _normalize_messages(msgs):
+                normalized_messages = _normalize_messages(msgs)
+                for batch_position, src_msg in enumerate(normalized_messages, start=1):
                     if not src_msg or src_msg.empty:
                         continue
                     try:
@@ -841,6 +938,14 @@ async def incoming_private_messages(client: Client, message: Message):
                         stored_count += 1
                     except Exception as e:
                         logger.error(f"Failed to archive msg {src_msg.id}: {e}")
+                    if batch_position % 10 == 0 or batch_position == len(normalized_messages):
+                        try:
+                            await status_msg.edit_text(
+                                f"⏳ Batch progress: **{stored_count}** files archived; "
+                                f"checked **{batch_position}/{len(normalized_messages)}** in this segment."
+                            )
+                        except Exception as exc:
+                            logger.debug("Could not update /batch progress: %s", exc)
 
             if not stored_count or not archived_ids:
                 return await status_msg.edit_text("❌ No messages were successfully copied.")
@@ -853,6 +958,10 @@ async def incoming_private_messages(client: Client, message: Message):
                     f"❌ Files were archived, but the batch link could not be saved: `{exc}`"
                 )
             batch_hash = encode_batch_manifest_id(manifest_id)
+            try:
+                bot.state_store.database.record_link("batch_" + batch_hash, "batch_manifest", manifest_id)
+            except Exception:
+                logger.exception("Could not record /batch link metadata.")
             batch_url = f"https://t.me/{bot.username}?start=batch_{batch_hash}"
 
             await bot.state_store.update_stats(total_links=1, total_files=stored_count)
@@ -903,7 +1012,7 @@ async def incoming_private_messages(client: Client, message: Message):
                             reply_markup=InlineKeyboardMarkup(buttons)
                         )
             except MessageNotModified:
-                pass
+                logger.debug("Upload queue message was already up to date.")
             except Exception as exc:
                 logger.warning("Could not update /getlink queue status: %s", exc)
         return
@@ -914,6 +1023,10 @@ async def incoming_private_messages(client: Client, message: Message):
         if not copied:
             return await message.reply_text("❌ File could not be verified in the archive. Please retry.")
         link_hash = encode_message_id(copied.id)
+        try:
+            bot.state_store.database.record_link(link_hash, "single", copied.id)
+        except Exception:
+            logger.exception("Could not record individual link metadata.")
         file_url = f"https://t.me/{bot.username}?start={link_hash}"
         await bot.state_store.update_stats(total_links=1, total_files=1)
         return await message.reply_text(
@@ -957,9 +1070,12 @@ async def callback_router(client: Client, query: CallbackQuery):
             source_messages = sort_upload_messages(session.get("source_messages", {}).values())
             archived_by_source_id = session.setdefault("archived", {})
             failed_ids = []
+            progress_message = query.message
 
             # Archive sequentially in the original private-chat message order.
+            position = 0
             for source_message in source_messages:
+                position += 1
                 source_id = int(source_message.id)
                 if source_id in archived_by_source_id:
                     continue
@@ -971,6 +1087,14 @@ async def callback_router(client: Client, query: CallbackQuery):
                 except Exception:
                     logger.exception("Could not archive /getlink source message %s", source_id)
                     failed_ids.append(source_id)
+                if position % 10 == 0 or position == len(source_messages):
+                    try:
+                        await progress_message.edit_text(
+                            f"⏳ Saving upload: **{position}/{len(source_messages)}** messages processed.\n"
+                            f"Verified: **{len(archived_by_source_id)}** | Failed: **{len(failed_ids)}**"
+                        )
+                    except Exception as exc:
+                        logger.debug("Could not update upload progress: %s", exc)
 
             if failed_ids:
                 session["status"] = "recording"
@@ -987,10 +1111,18 @@ async def callback_router(client: Client, query: CallbackQuery):
             try:
                 if len(mids) == 1:
                     code = encode_message_id(mids[0])
+                    try:
+                        bot.state_store.database.record_link(code, "single", mids[0])
+                    except Exception:
+                        logger.exception("Could not record single-message batch link metadata.")
                     url = f"https://t.me/{bot.username}?start={code}"
                 else:
                     manifest_id = await save_batch_manifest(bot, bot.archive_channel_id, mids)
                     code = encode_batch_manifest_id(manifest_id)
+                    try:
+                        bot.state_store.database.record_link("batch_" + code, "batch_manifest", manifest_id)
+                    except Exception:
+                        logger.exception("Could not record batch link metadata.")
                     url = f"https://t.me/{bot.username}?start=batch_{code}"
             except Exception:
                 session["status"] = "recording"
@@ -1064,7 +1196,7 @@ async def callback_router(client: Client, query: CallbackQuery):
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]])
             )
         except MessageNotModified:
-            pass
+            logger.debug("Admin status message was already up to date.")
 
     elif data == "adm_edit_welcome":
         ADMIN_PENDING_ACTIONS[user_id] = "welcome"
@@ -1106,13 +1238,16 @@ async def callback_router(client: Client, query: CallbackQuery):
         ADMIN_PENDING_DATA.pop(user_id, None)
         await query.answer()
         channels = bot.state_store.get_fsub_channels()
+        for configured_channel in channels:
+            if configured_channel.get("join_request") or configured_channel.get("type") == "join_request":
+                await _refresh_fsub_request_stats(client, configured_channel)
         channel_lines = []
         for index, channel in enumerate(channels, start=1):
             channel_id = int(channel.get("id") or 0)
             counts = bot.state_store.get_fsub_counts(channel_id)
             is_request = bool(channel.get("join_request") or channel.get("type") == "join_request")
             if is_request:
-                count_text = f"Requests: {counts['requests']} | Accepted: {counts['accepted']}"
+                count_text = f"Requests: {counts['requests']} | Accepted: {counts['accepted']} | Pending: {counts['pending']}"
                 method = "JOIN REQUEST"
             else:
                 count_text = f"Verified joined: {counts['joined']}"
@@ -1128,10 +1263,27 @@ async def callback_router(client: Client, query: CallbackQuery):
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("➕ Add Channel", callback_data="adm_fsub_add"),
                  InlineKeyboardButton("➖ Remove Channel", callback_data="adm_fsub_remove")],
+                [InlineKeyboardButton("✏️ Edit Channel Name", callback_data="adm_fsub_edit")],
                 [InlineKeyboardButton("📝 Edit FSUB Message", callback_data="adm_fsub_message")],
                 [InlineKeyboardButton("🧹 Clear Channel Counts", callback_data="adm_fsub_clear")],
                 [InlineKeyboardButton("🔙 Back", callback_data="adm_back")],
             ])
+        )
+
+    elif data == "adm_fsub_edit":
+        channels = bot.state_store.get_fsub_channels()
+        if not channels:
+            return await query.answer("No FSUB channels are configured.", show_alert=True)
+        ADMIN_PENDING_ACTIONS[user_id] = "fsub_edit_select"
+        ADMIN_PENDING_DATA.pop(user_id, None)
+        await query.answer()
+        options = [
+            f"{index}. {channel.get('name', 'Channel')} — {channel.get('id')}"
+            for index, channel in enumerate(channels, start=1)
+        ]
+        await query.message.reply_text(
+            "Send the number of the FSUB channel whose display name you want to edit:\n\n"
+            + "\n".join(options) + "\n\nSend /cancel to abort."
         )
 
     elif data == "adm_fsub_clear":
@@ -1226,8 +1378,8 @@ async def callback_router(client: Client, query: CallbackQuery):
             f"Method: **{'JOIN REQUEST' if join_request else 'NORMAL JOIN'}**\n"
             f"Invite link created automatically.\n\n"
             "For JOIN REQUEST, users can press the channel button and submit their request. "
-            "Once Telegram sends the bot that request, TRY AGAIN will verify it and unlock "
-            "the file even while approval is pending. The bot never auto-approves requests.",
+            "A request remains pending until a channel administrator approves it and Telegram "
+            "confirms membership. The bot never auto-approves or declines requests.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📋 View FSUB Channels", callback_data="adm_fsub")],
                 [InlineKeyboardButton("🔙 Admin Panel", callback_data="adm_back")],
@@ -1255,8 +1407,10 @@ async def callback_router(client: Client, query: CallbackQuery):
 
 
 def register_handlers(app: Client):
-    """Compatibility export for main.py."""
-    pass
+    """Compatibility export; handlers are registered once by decorators above."""
+    if app is not bot:
+        raise ValueError("ANIFLIX handlers are bound to the configured bot client.")
+    return True
 
 
 if __name__ == "__main__":

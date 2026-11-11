@@ -1,68 +1,102 @@
 # ANIFLIX FILE STORE BOT
 
-A Pyrogram bot that copies submitted messages into a Telegram archive channel and generates Telegram deep links for retrieval. It uses no MongoDB or other database service.
+ANIFLIX is the primary project. It uses Pyrofork, the existing Telegram archive channel, ordered batch manifests, and SQLite for local persistence. The reference FileLinkBot repository is not included as runtime code.
 
-## Commands and current behavior
+## Preserved behavior
 
-- `/start` — show the welcome text or retrieve the file/batch named by a deep-link payload. Force-subscription channels configured in the state are checked before delivery.
-- `/getlink` — start a private multi-message upload session. Send messages, then use **GENERATE LINK**, **PAUSE**, **RESUME**, or **CANCEL**. New multi-message links point to a verified ordered manifest, so unrelated archive messages between uploaded items are not included. Sessions are limited to 200 messages and are held in memory until link generation.
-- `/batch` — admin-only. Provide the first and last source-channel post by forwarding each post or sending its Telegram post link. The bot reads explicit message IDs in that bounded range, skips unavailable messages, archives successful copies, and creates a manifest-backed link. The source range is limited to 200 IDs. Use this only for content you own or have permission to republish.
-- `/admin` — show the available admin dashboard and basic counters.
-- `/status` — admin-only status and counters.
-- `/users` — admin-only registered-user count.
-- `/broadcast` — admin-only; reply to a message with `/broadcast` to copy it to registered users.
-- `/addadmin <numeric_user_id>` and `/deladmin <numeric_user_id>` — owner-only management of extra stored administrators. The owner and `ADMINS` environment IDs cannot be removed.
+- `/start` — ANIFLIX welcome screen or retrieval through an existing deep-link payload.
+- `/getlink` — bounded multi-message upload session, original private-chat order preserved, with generate/pause/resume/cancel controls.
+- `/batch` — admin-only source-channel range archiver (maximum 200 source message IDs per batch).
+- `/admin` — existing ANIFLIX admin dashboard.
+- `/status` — admin counters.
+- `/users` — registered users with available names, usernames and IDs, paginated in groups of 35.
+- `/broadcast` — reply to a message with `/broadcast` to copy it to registered users.
+- `/addadmin <numeric_user_id>` and `/deladmin <numeric_user_id>` — owner-only extra administrator management.
+- Existing welcome and FSUB custom text/photo+caption support.
+- FSUB channel removal and display-name editing.
+- Existing callback names, ANIFLIX buttons, archive channel and existing file-link formats.
 
-The admin dashboard's existing **Edit Welcome** action now stores a new text welcome message. **FSUB Settings** supports adding/removing up to 10 channels and editing the subscription prompt. The bot must be an administrator in every FSUB channel for membership checks. The **Broadcast** dashboard action explains the existing reply-and-command flow; the command currently sends immediately and does not ask for a second confirmation.
+## File and link compatibility
 
-The existing single-message deep-link payloads and old inclusive range-based batch payloads remain decodable. New batch links use the existing `?start=batch_...` entry point but refer to a small archive manifest containing the exact ordered archive message IDs. Legacy range links are bounded to 200 IDs; because an old range payload did not record an exact manifest, its IDs may include messages that were not part of the original batch if unrelated archive posts were interleaved.
+- The existing Telegram archive channel remains the actual file store.
+- Single-file deep links keep their established encoded message-ID format.
+- Old inclusive range batch payloads remain readable (bounded to 200 IDs).
+- New batches use a verified `ANIFLIX_BATCH_V1` manifest containing exact ordered archive message IDs.
+- Archive message IDs are not renumbered or rewritten.
+- The new SQLite `file_records` table records source/archive metadata only after the archive copy has been verified. If a previously recorded source message is retried and its archive copy still exists, the bot reuses it.
+- Missing archive messages produce a clear unavailable-file response; the bot does not fabricate a replacement message.
 
-## Telegram permissions and `/batch`
+The bot does not delete Telegram archive messages. Do not manually delete or replace the pinned ANIFLIX state message unless you have a separate verified backup.
 
-Make the bot an administrator in the private archive channel with permission to post, edit, and pin messages. For `/batch`, the bot must be able to resolve the source channel and read the selected posts; make it an administrator in that source channel when using the bot account.
+## SQLite and state recovery
 
-State initialization and persistence do **not** call `get_chat_history`. It uses the pinned state message and, when available, a locally cached explicit message ID. `/batch` requests only the user-specified message IDs; it does not scan arbitrary history.
+`SQLITE_PATH` selects the SQLite database file. The default is `data/aniflix.sqlite3`.
 
-If Telegram returns `BOT_METHOD_INVALID` while `/batch` attempts to retrieve source posts using the bot account, set the optional `BATCH_USER_SESSION_STRING` to a separately authorized MTProto user session that can access that source channel. The bot starts this as a distinct read-only-in-purpose Pyrogram client for `/batch` source reads; archive writes and file delivery continue to use the bot account. Keep that session string private and enter it only in Render's secret environment-variable field. Do not commit it to Git or paste it into logs. This optional setting is not required for normal bot operation or state loading.
+The database contains:
+- A versioned state snapshot for ANIFLIX users, settings, FSUB configuration/statistics and counters.
+- Verified archive file metadata.
+- Generated-link metadata.
 
-## Persistence and Render Free
+Migrations are additive. The database checks its integrity, refuses a schema newer than the code supports, and creates a `.pre-migration.bak` backup before upgrading an existing recognized database. Unknown or incompatible existing schemas are backed up and rejected without modification so they can be inspected first. It does not drop or truncate tables.
 
-Persistent settings are stored as a small text record in the archive channel's pinned message. The archive channel must remain private and limited to trusted administrators. If the bot cannot edit or pin the record, settings may not persist after a restart. The local `bot_state_data.json` file is only a cache: Render Free has ephemeral local storage, so it must not be treated as permanent storage. The state is stored in a single Telegram text message and is subject to Telegram's message-size limit; the bot logs an error rather than pretending an oversized state was saved remotely.
+The original `#ANIFLIX_STATE_STORE_V1#` message in the existing archive channel is retained as a recovery/compatibility snapshot. Existing `bot_state_data.json` is also read as a legacy local cache. When both SQLite and the Telegram state message exist, the snapshot revision is compared so a newer state is not silently overwritten by an older one. If no snapshot can be found anywhere, startup fails closed instead of pinning empty defaults that could hide existing settings.
 
-Render Free web services can spin down or restart. The `/health` endpoint and UptimeRobot can help with availability checks, but they do not provide guaranteed always-on bot polling or durable local storage. Use Free for testing/best-effort operation and choose an always-on deployment for reliable continuous polling.
+**Important:** Render Free has an ephemeral filesystem. SQLite on Render Free is not guaranteed to survive redeploys or instance replacement. The archive-backed state snapshot can restore bot settings and counters, and old file links still point directly to Telegram archive message IDs, but the SQLite file metadata/link index is not a durable backup on Free. For durable SQLite metadata, attach a persistent disk on a Render plan that supports it and set `SQLITE_PATH` to the disk mount path (for example `/var/data/aniflix.sqlite3`). The Telegram archive channel remains the primary file store in either case.
+
+## Force subscription (FSUB)
+
+- Normal Join requires actual Telegram membership.
+- Join Request records a unique request only when Telegram reports it through the configured invite link.
+- A pending request does **not** unlock files.
+- A request becomes accepted only after Telegram confirms actual membership.
+- The admin statistics view refreshes the pending-request list using Pyrogram's read-only `get_chat_join_requests` method. A request that is no longer pending and is not a confirmed member is shown as closed (declined or withdrawn); Telegram does not expose which of those actions occurred to the bot.
+- The bot never automatically approves or declines requests.
+- Statistics are unique-user counts. Clearing one channel's displayed counts leaves its configuration, invite link and request evidence intact.
+- Removing a channel removes it from active FSUB checks and clears only that channel's request/stat records.
+
+The bot must be an administrator in every configured channel. Join Request setup additionally requires permission to create invite links. Membership/API errors fail closed.
+
+## Environment variables
+
+Required:
+- `BOT_TOKEN` — Telegram bot token.
+- `API_ID` — Telegram API ID.
+- `API_HASH` — Telegram API hash.
+- `OWNER_ID` — numeric Telegram owner ID.
+- `DB_CHANNEL` — existing private archive channel ID in `-100…` form. Despite the legacy name, this is **not** a database.
+
+Optional:
+- `SQLITE_PATH` — SQLite file path; default `data/aniflix.sqlite3`.
+- `ADMINS` — comma/semicolon-separated numeric admin IDs.
+- `BATCH_USER_SESSION_STRING` — optional authorized MTProto reader session for `/batch` source reads only. Keep it in Render secret settings; never commit or log it.
+- `PORT` — Render web health server port; Render supplies this automatically.
+- `SESSION_NAME` — Pyrogram session name; default `aniflix_file_store`.
+- `PROTECT_CONTENT` — `true`/`false`; default `true`.
+- `BOT_DISPLAY_NAME`, `OWNER_CREDIT`, `DEVELOPER_CREDIT`, `UPDATES_URL`, `ONGOING_URL`, `SUPPORT_URL` — ANIFLIX display settings.
+- `ARCHIVE_CHANNEL_ID` — optional alias for `DB_CHANNEL`.
+
+See `.env.example` for names and non-secret defaults. Do not put real tokens, hashes, or session strings in the repository.
 
 ## Render deployment
 
-1. Push the contents of this ZIP's project folder to a GitHub repository.
-2. In Render, choose **New + → Blueprint** and connect that repository, or create a Python Web Service from the repository.
-3. Use the repository's `render.yaml` settings, or enter:
-   - Build command: `pip install --no-cache-dir -r requirements.txt`
-   - Start command: `python main.py`
-   - Health check path: `/health`
-4. Set these required environment variables in Render:
-   - `BOT_TOKEN` — token from BotFather
-   - `API_ID` and `API_HASH` — Telegram API credentials
-   - `OWNER_ID` — your numeric Telegram user ID
-   - `DB_CHANNEL` — private archive channel ID in `-100…` form; despite the legacy name, this is not a database
-5. Optionally set `ADMINS` as comma-separated numeric Telegram user IDs and `PROTECT_CONTENT=true` or `false`.
-6. Leave `BATCH_USER_SESSION_STRING` blank unless `/batch` receives `BOT_METHOD_INVALID` for source message retrieval. If required, provide a separately authorized session securely through Render's environment settings.
-7. Add the bot as an administrator in the archive channel with posting, editing, and pinning permissions. For source retrieval in `/batch`, also add it as an administrator in the source channel unless using the optional reader session.
-8. Deploy, wait for the `/health` check to pass, then test `/getlink` with a few permitted messages. Test `/batch` only with a channel you control or have permission to republish.
+The included `render.yaml` uses:
+- Build: `pip install --no-cache-dir -r requirements.txt`
+- Start: `python main.py`
+- Health check: `/health`
+- Plan: `free`
 
-Never add real tokens, API hashes, or session strings to `.env.example` or Git. `.env.example` contains variable names only. No live Telegram deployment test was performed as part of these local repairs.
+Set the five required variables above in Render. Leave `SQLITE_PATH` at its default on Free (with the persistence limitation described above). If you later attach a persistent disk, use its mount path for `SQLITE_PATH`.
+
+Add the bot as an administrator in the existing archive channel with permission to post, edit and pin the state record. Do not create a replacement storage channel. For `/batch`, the bot must be able to access the source channel; use `BATCH_USER_SESSION_STRING` only if the bot account receives `BOT_METHOD_INVALID` when reading the explicitly selected source message IDs.
+
+Render Free can spin down and restart; the health endpoint does not guarantee always-on Telegram polling. A live Telegram or Render deployment test has not been performed by local tests.
 
 ## Local checks
 
-Install declared dependencies and run:
-
 ```bash
-pip install -r requirements.txt
+pip install --no-cache-dir -r requirements.txt
 python -m compileall -q .
 python -m unittest discover -s tests -v
 ```
 
-The tests use mocked Telegram operations; they do not claim live Telegram verification.
-
-## Scope note
-
-The uploaded source provided counters but not upload-history browsing, failed-upload tracking, or a detailed storage inventory; these are not claimed as working features. `/users` reports the registered-user count rather than a paginated user list. The bot also does not include a broadcast confirmation step. Existing deployments should first test configuration changes with a small permitted sample.
+Tests using fake Telegram clients are local checks only. They do not verify a real bot token, Telegram permissions, channel membership updates, live archive access, or Render deployment.

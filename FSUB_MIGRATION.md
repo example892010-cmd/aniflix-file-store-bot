@@ -1,56 +1,20 @@
-# ANIFLIX FSUB migration patch
+# ANIFLIX persistence and FSUB migration notes
 
-This patch ports the public repository's force-subscription configuration pattern into
-ANIFLIX while retaining ANIFLIX's existing persistent `StateStore`, admin callbacks,
-and `/start` deep-link format. It does not add MongoDB.
+This reconstruction retains the existing `#ANIFLIX_STATE_STORE_V1#` pinned archive-channel record and imports it into a versioned SQLite snapshot. The Telegram archive channel remains the file store. Existing archive messages, message IDs, and deep-link payloads are not rewritten.
 
-## Apply
+## SQLite migration
 
-Copy the files in this patch ZIP into the matching paths in your ANIFLIX repository,
-overwriting `bot.py` and adding the new helper/test/documentation files.
+- Set `SQLITE_PATH` to the desired SQLite file path. Default: `data/aniflix.sqlite3`.
+- On first schema upgrade, the database module creates a `.pre-migration.bak` backup before applying additive schema changes.
+- SQLite migrations use `CREATE TABLE IF NOT EXISTS`; they do not drop or truncate tables.
+- The state snapshot is imported from the existing pinned state message or legacy `bot_state_data.json` cache when available.
+- SQLite is written first; the existing archive state record is maintained as a recovery copy.
+- If SQLite is newer than the archive snapshot, the newer SQLite state is republished to the archive state message. If no state snapshot exists anywhere, startup fails closed rather than creating empty defaults. No archive file messages are touched.
 
-## Add a channel from `/admin`
+## FSUB behavior
 
-Open **FSUB Settings → Add Channel**. The new channel-ID format is:
+Both Normal Join and Join Request require confirmed Telegram membership to access files. A `chat_join_request` update is recorded as pending evidence only. Acceptance is counted only after membership is confirmed. The bot does not automatically approve or decline requests.
 
-`-1001234567890 | no | 0`
+## Important Render limitation
 
-Fields:
-1. Telegram channel ID (must begin with `-100`)
-2. `yes` or `no` to create a join-request invite link
-3. Invite expiry in minutes; `0` means no expiry
-
-The bot must be an administrator in that channel and have permission to create invite
-links. For a timed link, the bot generates a fresh invite when showing the FSUB gate.
-
-The previous ANIFLIX format remains supported:
-
-`@channelusername | https://t.me/join-link | Button label`
-
-Up to 10 channels are still supported and settings remain saved through the existing
-archive-channel-backed state store.
-
-## Verification behavior
-
-- `/start` and deep-link `/start PAYLOAD` both check FSUB.
-- A deep-link payload is retained through the **Try Again** callback.
-- Membership is accepted only for confirmed members, administrators, owners, or
-  restricted users whose `is_member` flag is true.
-- `LEFT`, `KICKED`, pending/unknown membership, and API errors do not bypass FSUB.
-- The bot must be an administrator in every configured private channel to check users.
-- Join-request invite links are supported, but a pending request does not count as
-  membership; the user must be approved and become a member before access is granted.
-
-No MongoDB, new environment variables, or storage architecture changes are required.
-
-## Tests
-
-Run:
-
-```bash
-python -m unittest tests.test_fsub_system -v
-python -m compileall -q .
-```
-
-The tests cover membership-status interpretation and fail-closed behavior using a fake
-Telegram client. They do not constitute live Telegram verification.
+Render Free uses an ephemeral filesystem. `SQLITE_PATH=data/aniflix.sqlite3` works during a running instance but is not durable across every redeploy/restart. The existing Telegram state message provides a recovery copy for settings and counters, but it is not a substitute for a persistent SQLite disk for all normalized metadata. For durable SQLite file metadata, attach a persistent disk on a plan that supports it and set `SQLITE_PATH` to its mount path (for example `/var/data/aniflix.sqlite3`). Do not switch or recreate the Telegram archive channel.

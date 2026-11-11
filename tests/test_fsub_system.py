@@ -82,7 +82,7 @@ class ForceSubIntegrationSourceTests(unittest.TestCase):
         end = self.source.index("\nbot.on_message(filters.command(\"start\")", start)
         body = self.source[start:end]
         self.assertIn("unjoined = await check_fsub(client, user_id)", body)
-        self.assertIn("reply_markup=await get_fsub_keyboard", body)
+        self.assertIn("reply_markup=get_fsub_keyboard", body)
 
     def test_retry_callback_keeps_deep_link_payload(self):
         callback = self.source.index('if data.startswith("try_again"):')
@@ -91,8 +91,9 @@ class ForceSubIntegrationSourceTests(unittest.TestCase):
         self.assertIn("_deliver_start_payload(client, user_id, query.message, param)", section)
 
     def test_old_and_new_admin_input_formats_are_retained(self):
-        self.assertIn("https://t.me/join-link", self.source)
-        self.assertIn("channel ID | request yes/no | expiry minutes", self.source)
+        self.assertIn("Forward any message from that channel here.", self.source)
+        self.assertIn("adm_fsub_method_request", self.source)
+        self.assertIn("adm_fsub_method_normal", self.source)
 
 
 if __name__ == "__main__":

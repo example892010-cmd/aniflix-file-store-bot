@@ -8,16 +8,26 @@
 4. Forward a message from that channel to the bot.
 5. The bot identifies the channel and verifies its administrator status and invite-link permission.
 6. Choose **JOIN REQUEST** or **NORMAL JOIN**.
-7. The bot creates the matching Telegram invite link and stores the channel and method in the existing persistent state store.
+7. The bot creates the matching invite link and saves the configuration in SQLite and the archive-backed recovery state.
+
+## Channel management
+
+Administrators can remove a channel or edit its display name from the FSUB settings panel. Editing the display name does not change its channel ID, invite link, method, or statistics.
 
 ## User verification
 
-- **NORMAL JOIN:** The user must actually join. `TRY AGAIN` checks Telegram membership and does not unlock the file until membership is confirmed.
-- **JOIN REQUEST:** The user opens the bot-generated request link and submits a join request. Telegram sends the bot a `chat_join_request` update; the bot verifies that the request came through this channel's configured FSUB invite link and stores the user/channel pair persistently. When the user presses `TRY AGAIN`, that recorded request is enough to unlock the file, even while the request is still pending. The user does not need to submit the same request again.
-- The bot never approves or declines requests automatically. Channel administrators retain control of approval.
+- **NORMAL JOIN:** The user must actually join. **TRY AGAIN** checks Telegram membership; only a confirmed member passes.
+- **JOIN REQUEST:** Telegram's `chat_join_request` update records a unique pending request made through the configured invite link. A pending request does **not** unlock files. The user must wait for a channel administrator to approve the request. The bot then verifies actual membership through Telegram membership checks/updates before granting access.
+- The bot never automatically approves or declines requests.
+- API errors, missing permissions, unknown status, and unconfirmed membership fail closed.
 
-A request made before the bot receives the Telegram update, through a different invite link, or while the bot is not receiving updates cannot be verified retroactively. The bot must remain an administrator with **Invite Users via Link** permission so Telegram can deliver join-request updates.
+## Statistics
+
+- Normal Join: unique confirmed members.
+- Join Request: unique requests, unique accepted requests confirmed by membership, and pending requests (`requests - accepted`).
+- Clearing a channel's displayed statistics does not remove its channel configuration, invite link, or saved request evidence used to correlate a later membership acceptance.
+- Statistics cannot reconstruct updates Telegram never delivered while the bot was offline or lacked channel administrator permissions.
 
 ## Deployment
 
-No new environment variable, database, shell command, or manual invite-link entry is required. The join-request records are saved in the existing state store alongside the channel list. Existing channel entries remain readable and removable.
+The bot must remain an administrator in configured channels. Join Request setup also requires permission to create invite links. No request is automatically approved or declined.

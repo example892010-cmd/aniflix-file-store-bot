@@ -15,7 +15,7 @@ class Settings:
     archive_channel_id: int
     admins: tuple[int, ...]
     port: int = 10000
-    protect_content: bool = False
+    protect_content: bool = True
     bot_display_name: str = "ANIFLIX FILE STORE BOT"
     owner_credit: str = "@TANJIROKAMADO404"
     developer_credit: str = "@TANJIROKAMADO404"
@@ -24,6 +24,7 @@ class Settings:
     support_url: str = "https://t.me/+1jDuhUQ41hA1YmVl"
     session_name: str = "aniflix_file_store"
     batch_user_session_string: str | None = None
+    sqlite_path: str = "data/aniflix.sqlite3"
 
 
 def _required(env: dict[str, str], name: str, alias: str | None = None) -> str:
@@ -91,8 +92,8 @@ def load_settings(source: dict[str, str] | None = None) -> Settings:
         archive_channel_id=archive_channel_id,
         admins=tuple(sorted(admins)),
         port=port,
-        # Content protection is intentionally disabled so recipients can forward files.
-        protect_content=False,
+        # Respect the deployment setting; the default protects delivered content.
+        protect_content=_boolean(env.get("PROTECT_CONTENT"), True),
         bot_display_name=env.get("BOT_DISPLAY_NAME", "ANIFLIX FILE STORE BOT").strip() or "ANIFLIX FILE STORE BOT",
         owner_credit=env.get("OWNER_CREDIT", "@TANJIROKAMADO404").strip(),
         developer_credit=env.get("DEVELOPER_CREDIT", "@TANJIROKAMADO404").strip(),
@@ -101,4 +102,5 @@ def load_settings(source: dict[str, str] | None = None) -> Settings:
         support_url=_https_or_empty(env, "SUPPORT_URL", "https://t.me/+1jDuhUQ41hA1YmVl"),
         session_name=env.get("SESSION_NAME", "aniflix_file_store").strip() or "aniflix_file_store",
         batch_user_session_string=env.get("BATCH_USER_SESSION_STRING", "").strip() or None,
+        sqlite_path=env.get("SQLITE_PATH", "data/aniflix.sqlite3").strip() or "data/aniflix.sqlite3",
     )

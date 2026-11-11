@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 BATCH_MANIFEST_PREFIX = "ANIFLIX_BATCH_V1:"
 MAX_BATCH_MESSAGES = 200
+MAX_TELEGRAM_RETRIES = 4
 
 
 def _message_from_result(result):
@@ -36,19 +37,34 @@ async def _get_by_id(client, chat_id: int, message_id: int):
     return _message_from_result(result)
 
 
-async def archive_and_verify(client: Client, source_message: Message, archive_channel_id: int) -> int:
+async def archive_and_verify(
+    client: Client, source_message: Message, archive_channel_id: int, *,
+    return_message: bool = False,
+):
     """Copy a message to the archive and verify that its exact ID is readable."""
-    try:
-        copied = await source_message.copy(chat_id=archive_channel_id, disable_notification=True)
-    except FloodWait as wait:
-        await asyncio.sleep(wait.value)
-        copied = await source_message.copy(chat_id=archive_channel_id, disable_notification=True)
+    copied = None
+    for attempt in range(MAX_TELEGRAM_RETRIES):
+        try:
+            copied = await source_message.copy(
+                chat_id=archive_channel_id, disable_notification=True
+            )
+            break
+        except FloodWait as wait:
+            delay = max(1, int(getattr(wait, "value", 1) or 1))
+            logger.warning("Telegram FloodWait while archiving; sleeping %s seconds.", delay)
+            await asyncio.sleep(delay)
+        except (TimeoutError, ConnectionError, OSError):
+            if attempt + 1 >= MAX_TELEGRAM_RETRIES:
+                raise
+            await asyncio.sleep(min(2 ** attempt, 8))
+    if copied is None:
+        raise RuntimeError("Archive copy did not return a message after retries")
     if not copied or not getattr(copied, "id", None):
         raise RuntimeError("Archive copy returned no message ID")
     verified = await _get_by_id(client, archive_channel_id, copied.id)
     if not verified or int(getattr(verified, "id", 0)) != int(copied.id):
         raise RuntimeError(f"Archive message {copied.id} could not be verified")
-    return int(copied.id)
+    return verified if return_message else int(copied.id)
 
 
 async def deliver_archived_message(
@@ -65,11 +81,19 @@ async def deliver_archived_message(
     kwargs = {"chat_id": destination_chat_id}
     if protect_content:
         kwargs["protect_content"] = True
-    try:
-        return await archived.copy(**kwargs)
-    except FloodWait as wait:
-        await asyncio.sleep(wait.value)
-        return await archived.copy(**kwargs)
+    for attempt in range(MAX_TELEGRAM_RETRIES):
+        try:
+            return await archived.copy(**kwargs)
+        except FloodWait as wait:
+            delay = max(1, int(getattr(wait, "value", 1) or 1))
+            logger.warning("Telegram FloodWait while delivering archive message %s; sleeping %s seconds.",
+                           message_id, delay)
+            await asyncio.sleep(delay)
+        except (TimeoutError, ConnectionError, OSError):
+            if attempt + 1 >= MAX_TELEGRAM_RETRIES:
+                raise
+            await asyncio.sleep(min(2 ** attempt, 8))
+    raise RuntimeError(f"Could not deliver archive message {message_id} after retries")
 
 
 def encode_batch_manifest(message_ids: Sequence[int]) -> str:
@@ -148,19 +172,82 @@ async def deliver_archived_batch(
 
 
 class Storage:
-    """Small object wrapper retained for existing bot call sites."""
+    """Bounded archive operations with SQLite metadata and retry-safe deduplication."""
 
-    def __init__(self, client: Client, archive_channel_id: int):
+    MEDIA_FIELDS = (
+        "document", "video", "audio", "photo", "animation",
+        "voice", "video_note", "sticker",
+    )
+
+    def __init__(self, client: Client, archive_channel_id: int, database=None,
+                 max_concurrent_archives: int = 2):
         self.client = client
         self.archive_channel_id = archive_channel_id
+        self.database = database
+        self._archive_semaphore = asyncio.Semaphore(max(1, min(4, int(max_concurrent_archives))))
+
+    def _file_metadata(self, message: Message) -> dict:
+        media = None
+        media_type = ""
+        for field in self.MEDIA_FIELDS:
+            candidate = getattr(message, field, None)
+            if candidate:
+                media = candidate
+                media_type = field
+                break
+        return {
+            "media_type": media_type or str(getattr(message, "media", "") or ""),
+            "file_unique_id": getattr(media, "file_unique_id", "") if media else "",
+            "file_name": getattr(media, "file_name", "") if media else "",
+            "file_size": getattr(media, "file_size", 0) if media else 0,
+            "caption": getattr(message, "caption", None) or "",
+            "uploader_id": getattr(getattr(message, "from_user", None), "id", None),
+        }
 
     async def store_message(self, message: Message) -> Optional[Message]:
-        try:
-            message_id = await archive_and_verify(self.client, message, self.archive_channel_id)
-            return await self.get_message(message_id)
-        except Exception as exc:
-            logger.error("Failed to store message in archive: %s", exc)
-            return None
+        async with self._archive_semaphore:
+            source_chat = getattr(message, "chat", None)
+            source_chat_id = getattr(source_chat, "id", None)
+            if source_chat_id is None:
+                source_chat_id = getattr(getattr(message, "from_user", None), "id", None)
+            source_message_id = int(getattr(message, "id", 0) or 0)
+
+            # A retry of the same source update reuses its already verified archive copy.
+            if self.database and source_chat_id is not None and source_message_id > 0:
+                try:
+                    existing = self.database.find_file(source_chat_id, source_message_id)
+                    if existing:
+                        archived = await self.get_message(int(existing["archive_message_id"]))
+                        if archived:
+                            return archived
+                except Exception:
+                    logger.exception("Could not check prior archive record; continuing safely.")
+
+            try:
+                archived = await archive_and_verify(
+                    self.client, message, self.archive_channel_id, return_message=True
+                )
+                archive_message_id = int(archived.id)
+            except Exception as exc:
+                logger.error("Failed to store message in archive: %s", exc)
+                return None
+
+            # Metadata indexing is secondary to the verified Telegram archive copy.
+            # A local SQLite write failure must not discard a valid shareable file.
+            if self.database and source_chat_id is not None and source_message_id > 0:
+                try:
+                    metadata = self._file_metadata(message)
+                    self.database.record_file(
+                        source_chat_id=source_chat_id,
+                        source_message_id=source_message_id,
+                        archive_chat_id=self.archive_channel_id,
+                        archive_message_id=archive_message_id,
+                        **metadata,
+                    )
+                except Exception:
+                    logger.exception("Archived file %s but could not index its SQLite metadata.",
+                                     archive_message_id)
+            return archived
 
     async def get_message(self, message_id: int) -> Optional[Message]:
         try:
@@ -180,7 +267,8 @@ class Storage:
                 all_messages.append(message)
         return all_messages
 
-    async def deliver_message(self, to_chat_id: int, message_id: int, protect_content: bool = False) -> bool:
+    async def deliver_message(self, to_chat_id: int, message_id: int,
+                              protect_content: bool = False) -> bool:
         try:
             await deliver_archived_message(
                 self.client, self.archive_channel_id, message_id, to_chat_id, protect_content

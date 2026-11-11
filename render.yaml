@@ -17,6 +17,8 @@ services:
         sync: false
       - key: DB_CHANNEL
         sync: false
+      - key: SQLITE_PATH
+        value: data/aniflix.sqlite3
       - key: BATCH_USER_SESSION_STRING
         sync: false
       - key: ADMINS

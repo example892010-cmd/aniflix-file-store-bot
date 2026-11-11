@@ -49,8 +49,11 @@ class FsubRemovalTests(unittest.TestCase):
         self.assertTrue(store.saved)
 
     def test_remove_handler_calls_full_removal_method(self):
-        self.assertIn("await bot.state_store.remove_fsub_channel", BOT_SOURCE)
-        self.assertNotIn("await bot.state_store.set_fsub_channels(channels)\n            ADMIN_PENDING_ACTIONS.pop(user_id, None)", BOT_SOURCE)
+        start = BOT_SOURCE.index('if action == "fsub_remove":')
+        end = BOT_SOURCE.index("\n    if message.text", start)
+        removal_block = BOT_SOURCE[start:end]
+        self.assertIn("await bot.state_store.remove_fsub_channel", removal_block)
+        self.assertNotIn("await bot.state_store.set_fsub_channels(channels)", removal_block)
 
 
 if __name__ == "__main__":
