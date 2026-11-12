@@ -43,12 +43,6 @@ def _integer(value: str, name: str) -> int:
         raise ValueError(f"{name} must be an integer") from exc
 
 
-def _boolean(value: str | None, default: bool) -> bool:
-    if value is None or not value.strip():
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
 def _https_or_empty(env: dict[str, str], name: str, default: str) -> str:
     value = env.get(name, default).strip()
     if value and urlparse(value).scheme != "https":
@@ -92,8 +86,10 @@ def load_settings(source: dict[str, str] | None = None) -> Settings:
         archive_channel_id=archive_channel_id,
         admins=tuple(sorted(admins)),
         port=port,
-        # Respect the deployment setting; the default protects delivered content.
-        protect_content=_boolean(env.get("PROTECT_CONTENT"), True),
+        # Always allow recipients to forward/save files delivered by the bot.
+        # PROTECT_CONTENT is intentionally ignored, even if an old deployment
+        # still has it set to true.
+        protect_content=False,
         bot_display_name=env.get("BOT_DISPLAY_NAME", "ANIFLIX FILE STORE BOT").strip() or "ANIFLIX FILE STORE BOT",
         owner_credit=env.get("OWNER_CREDIT", "@TANJIROKAMADO404").strip(),
         developer_credit=env.get("DEVELOPER_CREDIT", "@TANJIROKAMADO404").strip(),
