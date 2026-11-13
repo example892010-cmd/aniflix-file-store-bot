@@ -33,7 +33,18 @@ from helper.storage import (
     save_auto_batch_manifest,
 )
 from helper.upload_order import ordered_archive_message_ids, sort_upload_messages
-from helper.anime_metadata import detect_auto_batch_metadata, build_auto_batch_result
+from helper.anime_metadata import (
+    detect_auto_batch_metadata,
+    build_auto_batch_result,
+    get_auto_batch_qualities,
+    build_auto_detection_preview,
+)
+from helper.auto_detect_settings import (
+    get_default_auto_detect_settings,
+    normalize_auto_detect_settings,
+    save_auto_detect_settings_to_store,
+    SUPPORTED_FORMATS,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -180,6 +191,44 @@ async def record_fsub_join_request(client: Client, request):
 
 
 
+def _get_auto_detect_settings():
+    """Read persisted auto-detection settings, falling back to safe defaults."""
+    saved = bot.state_store.get("auto_detect_settings", get_default_auto_detect_settings())
+    return normalize_auto_detect_settings(saved)
+
+
+def _auto_detect_settings_text():
+    settings = _get_auto_detect_settings()
+    enabled = "ON" if settings.get("enabled", True) else "OFF"
+    format_name = settings.get("format", "S{season} Ep{episode}")
+    title = settings.get("manual_title") or "Automatic filename detection"
+    custom = "Configured" if settings.get("custom_regex") else "Not configured"
+    return (
+        "🧠 **AUTO DETECT SETTINGS**\n\n"
+        f"Status: **{enabled}**\n"
+        f"Filename format: `{format_name}`\n"
+        f"Anime title: **{title}**\n"
+        f"Custom regex: **{custom}**\n"
+        f"Episode number padding: **{settings.get('episode_padding', 2)} digits**\n\n"
+        "Choose a setting below. Changes are saved and used by the next `/getlinkauto` batch."
+    )
+
+
+def _auto_detect_settings_keyboard():
+    settings = _get_auto_detect_settings()
+    toggle_label = "⏸ Disable Detection" if settings.get("enabled", True) else "▶️ Enable Detection"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle_label, callback_data="adm_autodetect_toggle")],
+        [InlineKeyboardButton("🧾 Filename Format", callback_data="adm_autodetect_format")],
+        [InlineKeyboardButton("✏️ Set Anime Title", callback_data="adm_autodetect_title")],
+        [InlineKeyboardButton("🧩 Set Custom Regex", callback_data="adm_autodetect_regex")],
+        [InlineKeyboardButton("🔢 Episode Padding", callback_data="adm_autodetect_padding")],
+        [InlineKeyboardButton("🧪 Test Detection", callback_data="adm_autodetect_test")],
+        [InlineKeyboardButton("♻️ Reset Defaults", callback_data="adm_autodetect_reset")],
+        [InlineKeyboardButton("🔙 Admin Panel", callback_data="adm_back")],
+    ])
+
+
 async def _finish_auto_channel_batch(client: Client, channel_id: int, session: dict):
     """Archive the quiet-period batch, publish one link, then remove source posts."""
     if AUTO_CHANNEL_SESSIONS.get(channel_id) is not session or session.get("status") != "collecting":
@@ -207,8 +256,9 @@ async def _finish_auto_channel_batch(client: Client, channel_id: int, session: d
         except Exception:
             logger.exception("Could not record /getlinkauto batch link metadata")
         url = f"https://t.me/{bot.username}?start=batch_{code}"
-        title, episodes = detect_auto_batch_metadata(messages)
-        result_text = build_auto_batch_result(title, episodes, url)
+        auto_settings = _get_auto_detect_settings()
+        title, episodes = detect_auto_batch_metadata(messages, settings=auto_settings)
+        result_text = build_auto_batch_result(title, episodes, url, settings=auto_settings)
         status_message = await client.send_message(channel_id, result_text, parse_mode=None)
         try:
             await bot.state_store.update_stats(total_links=1, total_files=len(archived_ids))
@@ -716,7 +766,8 @@ async def admin_panel(client: Client, message: Message):
         [InlineKeyboardButton("📢 FSUB Settings", callback_data="adm_fsub"),
          InlineKeyboardButton("📊 Bot Status", callback_data="adm_status")],
         [InlineKeyboardButton("📝 Edit Welcome", callback_data="adm_edit_welcome"),
-         InlineKeyboardButton("📬 Broadcast", callback_data="adm_broadcast")]
+         InlineKeyboardButton("📬 Broadcast", callback_data="adm_broadcast")],
+        [InlineKeyboardButton("🧠 Auto Detect Settings", callback_data="adm_autodetect")]
     ])
     await message.reply_text(text, reply_markup=kb)
 
@@ -880,6 +931,57 @@ async def incoming_private_messages(client: Client, message: Message):
             ADMIN_PENDING_ACTIONS.pop(user_id, None)
             ADMIN_PENDING_DATA.pop(user_id, None)
             return await message.reply_text("⛔ Unauthorized.")
+        if action == "autodetect_title":
+            title_value = (message.text or message.caption or "").strip()
+            if not title_value:
+                return await message.reply_text("Send a title, `auto`, or /cancel.")
+            settings = _get_auto_detect_settings()
+            settings["manual_title"] = "" if title_value.lower() == "auto" else title_value[:150]
+            await save_auto_detect_settings_to_store(bot.state_store, settings)
+            ADMIN_PENDING_ACTIONS.pop(user_id, None)
+            return await message.reply_text(
+                "✅ Anime title override cleared." if not settings["manual_title"] else "✅ Anime title override saved."
+            )
+
+        if action == "autodetect_regex":
+            regex_value = (message.text or message.caption or "").strip()
+            if not regex_value:
+                return await message.reply_text("Send a regex with named `season` and `episode` groups, or /cancel.")
+            settings = _get_auto_detect_settings()
+            settings["format"] = "CUSTOM"
+            settings["custom_regex"] = regex_value
+            try:
+                normalize_auto_detect_settings(settings)
+                from helper.auto_detect_settings import get_auto_detect_pattern
+                get_auto_detect_pattern(settings)
+            except Exception as exc:
+                return await message.reply_text(f"❌ Invalid regex: {exc}\nPlease send a valid regex or /cancel.")
+            await save_auto_detect_settings_to_store(bot.state_store, settings)
+            ADMIN_PENDING_ACTIONS.pop(user_id, None)
+            return await message.reply_text("✅ Custom filename regex saved and enabled.")
+
+        if action == "autodetect_test":
+            sample_text = (message.text or message.caption or "").strip()
+            if not sample_text:
+                return await message.reply_text("Send sample filenames, one per line, or /cancel.")
+            from types import SimpleNamespace
+            sample_messages = [
+                SimpleNamespace(document=SimpleNamespace(file_name=line.strip()), caption=None, text=None)
+                for line in sample_text.splitlines() if line.strip()
+            ]
+            settings = _get_auto_detect_settings()
+            detected_title, detected_episodes = detect_auto_batch_metadata(sample_messages, settings=settings)
+            qualities = get_auto_batch_qualities(sample_messages)
+            preview = build_auto_detection_preview(
+                detected_title, detected_episodes, qualities=qualities, settings=settings
+            )
+            ADMIN_PENDING_ACTIONS.pop(user_id, None)
+            return await message.reply_text(
+                "🧪 **AUTO DETECTION TEST**\n\n" + preview,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Auto Detect Settings", callback_data="adm_autodetect")]]),
+                parse_mode=None,
+            )
+
         if action == "fsub_add_forward":
             channel = _forwarded_channel(message)
             if channel is None:
@@ -1335,6 +1437,108 @@ async def callback_router(client: Client, query: CallbackQuery):
             del USER_UPLOAD_SESSIONS[user_id]
         await query.answer("Upload session cancelled.")
         await query.message.edit_text("❌ Upload session cancelled.")
+
+    elif data == "adm_autodetect":
+        ADMIN_PENDING_ACTIONS.pop(user_id, None)
+        ADMIN_PENDING_DATA.pop(user_id, None)
+        await query.answer()
+        await query.message.edit_text(
+            _auto_detect_settings_text(),
+            reply_markup=_auto_detect_settings_keyboard(),
+        )
+
+    elif data == "adm_autodetect_toggle":
+        settings = _get_auto_detect_settings()
+        settings["enabled"] = not settings.get("enabled", True)
+        await save_auto_detect_settings_to_store(bot.state_store, settings)
+        await query.answer("Auto detection updated.")
+        await query.message.edit_text(
+            _auto_detect_settings_text(),
+            reply_markup=_auto_detect_settings_keyboard(),
+        )
+
+    elif data == "adm_autodetect_format":
+        settings = _get_auto_detect_settings()
+        buttons = []
+        for index, format_name in enumerate(SUPPORTED_FORMATS):
+            buttons.append([InlineKeyboardButton(
+                format_name,
+                callback_data=f"adm_autodetect_fmt_{index}",
+            )])
+        buttons.append([InlineKeyboardButton("CUSTOM REGEX", callback_data="adm_autodetect_fmt_custom")])
+        buttons.append([InlineKeyboardButton("🔙 Auto Detect Settings", callback_data="adm_autodetect")])
+        await query.answer()
+        await query.message.edit_text(
+            "🧾 **Choose filename format**\n\n"
+            "Select the pattern used to find season and episode numbers in filenames.",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    elif data.startswith("adm_autodetect_fmt_"):
+        settings = _get_auto_detect_settings()
+        choice = data.rsplit("_", 1)[-1]
+        if choice == "custom":
+            ADMIN_PENDING_ACTIONS[user_id] = "autodetect_regex"
+            await query.answer()
+            await query.message.edit_text(
+                "🧩 Send a Python regex containing named groups `(?P<season>...)` and `(?P<episode>...)`.\n\n"
+                "Example: `S(?P<season>\\d{1,2})\\s*EP(?P<episode>\\d{1,4})`\n"
+                "Send /cancel to abort.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="adm_autodetect")]]),
+            )
+        else:
+            try:
+                index = int(choice)
+                selected_format = list(SUPPORTED_FORMATS.keys())[index]
+            except (ValueError, IndexError):
+                return await query.answer("Invalid format selection.", show_alert=True)
+            settings["format"] = selected_format
+            await save_auto_detect_settings_to_store(bot.state_store, settings)
+            await query.answer("Filename format saved.")
+            await query.message.edit_text(_auto_detect_settings_text(), reply_markup=_auto_detect_settings_keyboard())
+
+    elif data == "adm_autodetect_title":
+        ADMIN_PENDING_ACTIONS[user_id] = "autodetect_title"
+        await query.answer()
+        await query.message.edit_text(
+            "✏️ Send the anime title to use for every `/getlinkauto` batch.\n"
+            "Send `auto` to return to automatic title detection, or /cancel to abort.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="adm_autodetect")]]),
+        )
+
+    elif data == "adm_autodetect_regex":
+        ADMIN_PENDING_ACTIONS[user_id] = "autodetect_regex"
+        await query.answer()
+        await query.message.edit_text(
+            "🧩 Send a Python regex with named groups `season` and `episode`.\n"
+            "Example: `S(?P<season>\\d{1,2})\\s*EP(?P<episode>\\d{1,4})`\n"
+            "Send /cancel to abort.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="adm_autodetect")]]),
+        )
+
+    elif data == "adm_autodetect_padding":
+        settings = _get_auto_detect_settings()
+        settings["episode_padding"] = 3 if int(settings.get("episode_padding", 2)) == 2 else 2
+        await save_auto_detect_settings_to_store(bot.state_store, settings)
+        await query.answer(f"Episode padding: {settings['episode_padding']} digits")
+        await query.message.edit_text(_auto_detect_settings_text(), reply_markup=_auto_detect_settings_keyboard())
+
+    elif data == "adm_autodetect_reset":
+        await save_auto_detect_settings_to_store(bot.state_store, get_default_auto_detect_settings())
+        ADMIN_PENDING_ACTIONS.pop(user_id, None)
+        ADMIN_PENDING_DATA.pop(user_id, None)
+        await query.answer("Default settings restored.")
+        await query.message.edit_text(_auto_detect_settings_text(), reply_markup=_auto_detect_settings_keyboard())
+
+    elif data == "adm_autodetect_test":
+        ADMIN_PENDING_ACTIONS[user_id] = "autodetect_test"
+        await query.answer()
+        await query.message.edit_text(
+            "🧪 Send one or more sample filenames (one filename per line).\n"
+            "I will show the detected title, seasons, episodes and qualities without creating a link.\n\n"
+            "Send /cancel to abort.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="adm_autodetect")]]),
+        )
 
     elif data == "adm_status":
         await query.answer()
