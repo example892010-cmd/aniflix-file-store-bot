@@ -1,16 +1,21 @@
 import re
 
 
-# Matches S01 / Season 01 even when surrounded by underscores, dots, or followed directly by E01
+# Matches S01, S18, Season 01, Season 1, etc.
 AUTO_SEASON_RE = re.compile(
     r"(?:^|[\s._\-\[\(])S(?:EASON)?[\s._\-]*0*(\d{1,2})(?=[\s._\-\]\)]|E(?:P(?:ISODE)?)?\s*\d|$)",
     re.IGNORECASE,
 )
 
-# Matches E01 / EP01 / Episode 01 even when preceded by S01 or underscores
+# Matches E01, EP01, Ep383, Episode 01 (searched AFTER the season tag)
 AUTO_EPISODE_RE = re.compile(
-    r"(?:^|[\s._\-\[\(]|S\d{1,2})E(?:PISODE|P)?[\s._\-]*0*(\d{1,4})(?=[\s._\-\]\)]|$)",
+    r"(?:^|[\s._\-\[\(])E(?:PISODE|P)?[\s._\-]*0*(\d{1,4})(?=[\s._\-\]\)]|$)",
     re.IGNORECASE,
+)
+
+# Fallback for formats like "S18 - 383" or "S18 383" where "Ep" is omitted
+AUTO_BARE_EPISODE_RE = re.compile(
+    r"^\s*[\-._\s]+\s*0*(\d{1,4})(?=[\s._\-\]\)]|$)",
 )
 
 
@@ -70,9 +75,12 @@ def _clean_anime_title(title):
     title = title.strip()
 
     # Remove leading @channel_name separated by underscores, spaces, dots, or hyphens
-    title = re.sub(r"^@[A-Za-z0-9]+(?:[\s._\-]+|$)", "", title)
+    title = re.sub(r"^@[A-Za-z0-9_]+?(?:[\s._\-]+|$)", "", title)
 
-    # Remove bracketed release information
+    # Specifically catch @ANIFLIXANIMETAMIL even if jammed directly against the title
+    title = re.sub(r"^@?ANIFLIXANIMETAMIL[\s._\-]*", "", title, flags=re.IGNORECASE)
+
+    # Remove bracketed or parenthesized release tags like [1080p] or (Dual Audio)
     title = re.sub(r"\[[^\]]*\]", " ", title)
     title = re.sub(r"\([^)]*\)", " ", title)
 
@@ -102,17 +110,25 @@ def detect_auto_batch_metadata(messages):
         if not filename:
             continue
 
-        season_match = AUTO_SEASON_RE.search(filename)
-        episode_match = AUTO_EPISODE_RE.search(filename)
+        # Strip file extension (.mkv, .mp4, etc.) before parsing
+        clean_filename = re.sub(r"\.[a-zA-Z0-9]{2,4}$", "", filename.strip())
 
-        if not season_match or not episode_match:
+        season_match = AUTO_SEASON_RE.search(clean_filename)
+        if not season_match:
+            continue
+
+        # Search for episode strictly AFTER the season tag so S18 never collides with Ep383
+        after_season = clean_filename[season_match.end():]
+        episode_match = AUTO_EPISODE_RE.search(after_season) or AUTO_BARE_EPISODE_RE.search(after_season)
+
+        if not episode_match:
             continue
 
         season = int(season_match.group(1))
         episode = int(episode_match.group(1))
 
-        # Get title from text before S01/S02/etc.
-        raw_title = filename[:season_match.start()]
+        # Get title from text before S01/S18/Season 01
+        raw_title = clean_filename[:season_match.start()]
         cleaned_title = _clean_anime_title(raw_title)
 
         if cleaned_title and (title is None or title == "ANIME"):
