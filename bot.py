@@ -1,7 +1,7 @@
-Import asyncio
+import asyncio
 import logging
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Iterable
 from urllib.parse import urlparse
 from pyrogram import Client, filters
 from pyrogram.types import (
@@ -33,18 +33,6 @@ from helper.storage import (
     save_auto_batch_manifest,
 )
 from helper.upload_order import ordered_archive_message_ids, sort_upload_messages
-from helper.anime_metadata import (
-    detect_auto_batch_metadata,
-    build_auto_batch_result,
-    get_auto_batch_qualities,
-    build_auto_detection_preview,
-)
-from helper.auto_detect_settings import (
-    get_default_auto_detect_settings,
-    normalize_auto_detect_settings,
-    save_auto_detect_settings_to_store,
-    SUPPORTED_FORMATS,
-)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,22 +44,171 @@ logger = logging.getLogger("ANIFLIX-FILE-STORE-BOT")
 USER_UPLOAD_SESSIONS: Dict[int, Dict] = {}
 # In-memory tracking for /batch forwarding sessions
 USER_BATCH_SESSIONS: Dict[int, Dict] = {}
-# Channel-scoped /getlinkauto sessions. Collection ends when all three
-# required quality versions are received for the same anime/season/episode.
+# Channel-scoped /getlinkauto sessions. Each complete episode is linked separately.
 AUTO_CHANNEL_SESSIONS: Dict[int, Dict] = {}
-AUTO_REQUIRED_QUALITIES = frozenset({"480p", "720p", "1080p"})
+AUTO_REQUIRED_QUALITIES = ("480p", "720p", "1080p")
 AUTO_QUALITY_RE = re.compile(
     r"(?<!\d)(480|720|1080)\s*p(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
+SUPPORTED_FORMATS = {
+    "S{season} Ep{episode}": r"(?<![A-Za-z0-9])S\s*(?P<season>\d{1,2})\s*EP?\s*(?P<episode>\d{1,4})(?!\d)",
+    "S{season}E{episode}": r"(?<![A-Za-z0-9])S\s*(?P<season>\d{1,2})\s*E\s*(?P<episode>\d{1,4})(?!\d)",
+    "Season {season} Episode {episode}": r"\bSeason\s*(?P<season>\d{1,2})\s*Episode\s*(?P<episode>\d{1,4})(?!\d)",
+    "{season}x{episode}": r"(?<!\d)(?P<season>\d{1,2})\s*[xX]\s*(?P<episode>\d{1,4})(?!\d)",
+}
 ADMIN_PENDING_ACTIONS: Dict[int, str] = {}
 ADMIN_PENDING_DATA: Dict[int, Dict] = {}
+
+
+def get_default_auto_detect_settings() -> Dict:
+    return {
+        "enabled": True,
+        "format": "S{season} Ep{episode}",
+        "custom_regex": "",
+        "manual_title": "",
+        "episode_padding": 2,
+    }
+
+
+def normalize_auto_detect_settings(settings) -> Dict:
+    """Normalize saved admin settings and validate custom detection expressions."""
+    result = get_default_auto_detect_settings()
+    if isinstance(settings, dict):
+        result.update(settings)
+    result["enabled"] = bool(result.get("enabled", True))
+    selected_format = str(result.get("format") or "S{season} Ep{episode}")
+    if selected_format not in SUPPORTED_FORMATS and selected_format != "CUSTOM":
+        selected_format = "S{season} Ep{episode}"
+    result["format"] = selected_format
+    result["custom_regex"] = str(result.get("custom_regex") or "").strip()[:500]
+    result["manual_title"] = str(result.get("manual_title") or "").strip()[:150]
+    try:
+        padding = int(result.get("episode_padding", 2))
+    except (TypeError, ValueError):
+        padding = 2
+    result["episode_padding"] = padding if 1 <= padding <= 4 else 2
+    if selected_format == "CUSTOM" and result["custom_regex"]:
+        custom = re.compile(result["custom_regex"], re.IGNORECASE)
+        if not {"season", "episode"}.issubset(custom.groupindex):
+            raise ValueError("Custom regex must contain named groups 'season' and 'episode'.")
+    return result
+
+
+def get_auto_detect_pattern(settings=None):
+    """Compile the selected filename format into a pattern with named groups."""
+    settings = normalize_auto_detect_settings(settings or get_default_auto_detect_settings())
+    selected_format = settings["format"]
+    if selected_format == "CUSTOM":
+        if not settings["custom_regex"]:
+            raise ValueError("No custom regex has been configured.")
+        pattern = re.compile(settings["custom_regex"], re.IGNORECASE)
+    else:
+        pattern = re.compile(SUPPORTED_FORMATS[selected_format], re.IGNORECASE)
+    if not {"season", "episode"}.issubset(pattern.groupindex):
+        raise ValueError("Episode pattern must contain named 'season' and 'episode' groups.")
+    return pattern
+
+
+async def save_auto_detect_settings_to_store(state_store, settings) -> None:
+    """Persist normalized detection settings to the bot state store."""
+    normalized = normalize_auto_detect_settings(settings)
+    await state_store.set("auto_detect_settings", normalized)
+
+
+def _message_filename(message) -> str:
+    for field in ("document", "video", "audio", "animation", "voice", "video_note"):
+        media = getattr(message, field, None)
+        filename = getattr(media, "file_name", None) if media else None
+        if filename:
+            return str(filename)
+    return str(getattr(message, "caption", None) or getattr(message, "text", None) or "")
+
+
+def clean_auto_detect_title(value: str) -> str:
+    """Remove uploader tags, quality/language labels, and separators from a title."""
+    title = re.sub(r"\.[A-Za-z0-9]{2,5}$", "", str(value or "")).strip()
+    title = re.sub(r"^\s*@[^\s]+\s*[-–—:]\s*", "", title)
+    title = re.sub(r"\[[^]]*\]|\([^)]*\)|\{[^}]*\}", " ", title)
+    title = re.sub(r"[_|]+", " ", title)
+    title = re.sub(r"\s*[-–—:]+\s*$", "", title)
+    title = re.sub(r"\s+", " ", title).strip(" ._-–—:")
+    title = re.sub(r"\bBERUS\b", "BEERUS", title, flags=re.IGNORECASE)
+    return title
+
+
+def detect_auto_batch_metadata(messages: Iterable, settings=None):
+    """Return uppercase title and {season: set(episodes)} for the supplied files."""
+    settings = normalize_auto_detect_settings(settings or get_default_auto_detect_settings())
+    pattern = get_auto_detect_pattern(settings)
+    episodes = {}
+    detected_title = settings.get("manual_title") or ""
+    for message in messages:
+        filename = _message_filename(message)
+        if not filename:
+            continue
+        match = pattern.search(filename)
+        if not match:
+            continue
+        try:
+            season = int(match.group("season"))
+            episode = int(match.group("episode"))
+        except (TypeError, ValueError):
+            continue
+        episodes.setdefault(season, set()).add(episode)
+        if not detected_title:
+            detected_title = clean_auto_detect_title(filename[:match.start()])
+    detected_title = re.sub(r"\s+", " ", detected_title).strip() or "ANIME FILES"
+    return detected_title.upper(), episodes
+
+
+def get_auto_batch_qualities(messages: Iterable):
+    found = set()
+    for message in messages:
+        match = AUTO_QUALITY_RE.search(_message_filename(message))
+        if match:
+            found.add(f"{match.group(1)}p".lower())
+    return [quality for quality in AUTO_REQUIRED_QUALITIES if quality in found]
+
+
+def build_auto_batch_result(title: str, episodes: dict, url: str, settings=None) -> str:
+    settings = normalize_auto_detect_settings(settings or get_default_auto_detect_settings())
+    padding = int(settings.get("episode_padding", 2))
+    lines = ["/batch1renamed", (title or "ANIME FILES").upper(), ""]
+    for season in sorted(episodes):
+        season_label = f"{int(season):02d}" if int(season) < 10 else str(int(season))
+        lines.append(f"Season {season_label}")
+        lines.extend(f"{int(episode):0{padding}d}" for episode in sorted(episodes[season]))
+        lines.append("")
+    if len(lines) == 3:
+        lines.extend(["Season 01", ""])
+    lines.append(url)
+    return "\n".join(lines).strip()
+
+
+def build_auto_detection_preview(title: str, episodes: dict, qualities=None, settings=None) -> str:
+    settings = normalize_auto_detect_settings(settings or get_default_auto_detect_settings())
+    padding = int(settings.get("episode_padding", 2))
+    episode_labels = []
+    for season in sorted(episodes):
+        for episode in sorted(episodes[season]):
+            episode_labels.append(f"S{int(season):02d} EP{int(episode):0{padding}d}")
+    quality_text = ", ".join(qualities or []) or "Not detected"
+    return (
+        f"Anime title: {title or 'Not detected'}\n"
+        f"Episodes: {', '.join(episode_labels) or 'Not detected'}\n"
+        f"Qualities: {quality_text}\n"
+        f"Required for each episode: 480p, 720p, 1080p"
+    )
+
 
 def _get_archive_channel_id() -> int:
     return bot.settings.archive_channel_id
 
+
 def _get_admins() -> List[int]:
     return list(bot.settings.admins)
+
 
 class AniflixBot(Client):
     def __init__(self, settings=None):
@@ -125,7 +262,9 @@ class AniflixBot(Client):
         self.state_store.close()
         logger.info("Bot stopped cleanly.")
 
+
 bot = AniflixBot()
+
 
 @bot.on_chat_member_updated(filters.channel)
 async def record_fsub_membership_update(client: Client, update):
@@ -154,6 +293,7 @@ async def record_fsub_membership_update(client: Client, update):
             return
     except Exception:
         logger.exception("Could not record FSUB membership update")
+
 
 @bot.on_chat_join_request(filters.channel)
 async def record_fsub_join_request(client: Client, request):
@@ -186,12 +326,20 @@ async def record_fsub_join_request(client: Client, request):
     except Exception:
         logger.exception("Could not record incoming FSUB join request")
 
+
 # ------------------- CHANNEL AUTO-LINK HELPERS ------------------- #
+
+
 
 def _get_auto_detect_settings():
     """Read persisted auto-detection settings, falling back to safe defaults."""
     saved = bot.state_store.get("auto_detect_settings", get_default_auto_detect_settings())
-    return normalize_auto_detect_settings(saved)
+    try:
+        return normalize_auto_detect_settings(saved)
+    except Exception:
+        logger.exception("Invalid saved auto-detection settings; using defaults.")
+        return get_default_auto_detect_settings()
+
 
 def _auto_detect_settings_text():
     settings = _get_auto_detect_settings()
@@ -209,6 +357,7 @@ def _auto_detect_settings_text():
         "Choose a setting below. Changes are saved and used by the next `/getlinkauto` batch."
     )
 
+
 def _auto_detect_settings_keyboard():
     settings = _get_auto_detect_settings()
     toggle_label = "⏸ Disable Detection" if settings.get("enabled", True) else "▶️ Enable Detection"
@@ -223,17 +372,17 @@ def _auto_detect_settings_keyboard():
         [InlineKeyboardButton("🔙 Admin Panel", callback_data="adm_back")],
     ])
 
+
 def _auto_channel_message_filename(message) -> str:
-    """Return a Telegram media filename, falling back to caption or text."""
-    for field in ("document", "video", "audio", "animation"):
-        media = getattr(message, field, None)
-        filename = getattr(media, "file_name", None) if media else None
-        if filename:
-            return str(filename)
-    return str(getattr(message, "caption", None) or getattr(message, "text", None) or "")
+    """Return a media filename/caption; ignore ordinary text channel posts."""
+    media_fields = ("document", "video", "audio", "animation", "photo", "voice", "video_note")
+    if not any(getattr(message, field, None) for field in media_fields):
+        return ""
+    return _message_filename(message)
+
 
 def _auto_message_quality_key(message, settings):
-    """Return ((normalized title, season, episode), quality) for a named file."""
+    """Return (episode key, display title, quality) for a correctly named media file."""
     filename = _auto_channel_message_filename(message)
     if not filename:
         return None
@@ -242,54 +391,63 @@ def _auto_message_quality_key(message, settings):
     if not quality_match:
         return None
 
-    # Use the same configurable filename format as the metadata detector.
     try:
-        from helper.auto_detect_settings import get_auto_detect_pattern
         episode_match = get_auto_detect_pattern(settings).search(filename)
         if not episode_match:
             return None
         season = int(episode_match.group("season"))
         episode = int(episode_match.group("episode"))
-    except (ImportError, AttributeError, KeyError, TypeError, ValueError, re.error):
-        logger.exception("Could not parse /getlinkauto season/episode from %r", filename)
+        title, detected_episodes = detect_auto_batch_metadata([message], settings=settings)
+    except (AttributeError, KeyError, TypeError, ValueError, re.error):
+        logger.exception("Could not parse /getlinkauto filename %r", filename)
         return None
 
-    title, detected_episodes = detect_auto_batch_metadata([message], settings=settings)
-    if not detected_episodes:
+    if season < 0 or episode < 0 or not detected_episodes:
         return None
-
     quality = f"{quality_match.group(1)}p".lower()
-    return (title.casefold(), season, episode), quality
+    normalized_title = re.sub(r"\s+", " ", title).strip().casefold()
+    if not normalized_title or normalized_title == "anime files":
+        return None
+    return (normalized_title, season, episode), title, quality
+
 
 def _record_auto_quality(session: dict, message, settings):
-    """Record a quality and return completion details once one episode has all 3."""
+    """Store one quality against its episode and return details when all 3 exist."""
     parsed = _auto_message_quality_key(message, settings)
     if not parsed:
         return None
 
-    episode_key, quality = parsed
-    quality_groups = session.setdefault("quality_groups", {})
-    received = quality_groups.setdefault(episode_key, set())
-    received.add(quality)
+    episode_key, title, quality = parsed
+    if episode_key in session.setdefault("completed_episodes", set()):
+        return None
 
-    if AUTO_REQUIRED_QUALITIES.issubset(received):
+    quality_groups = session.setdefault("quality_groups", {})
+    received = quality_groups.setdefault(episode_key, {})
+    # Keep only one file for each quality. A newer duplicate replaces an earlier
+    # one while the trio is still incomplete.
+    received[quality] = message
+    if all(required in received for required in AUTO_REQUIRED_QUALITIES):
         return {
-            "title": episode_key[0],
+            "key": episode_key,
+            "title": title,
             "season": episode_key[1],
             "episode": episode_key[2],
-            "qualities": sorted(received),
+            "qualities": list(AUTO_REQUIRED_QUALITIES),
+            "messages": {item: received[item] for item in AUTO_REQUIRED_QUALITIES},
         }
     return None
 
-async def _finish_auto_channel_batch(client: Client, channel_id: int, session: dict):
-    """Archive the completed quality set, publish one link, then remove source posts."""
+
+async def _finish_auto_channel_batch(client: Client, channel_id: int, session: dict, completion: dict):
+    """Archive exactly one episode's three qualities and publish one combined link."""
     if AUTO_CHANNEL_SESSIONS.get(channel_id) is not session or session.get("status") != "collecting":
         return
-    session["status"] = "processing"
-    messages = sorted(session.get("messages", {}).values(), key=lambda item: int(item.id))
-    if not messages:
-        AUTO_CHANNEL_SESSIONS.pop(channel_id, None)
+
+    episode_key = completion["key"]
+    if episode_key in session.setdefault("completed_episodes", set()):
         return
+
+    messages = [completion["messages"][quality] for quality in AUTO_REQUIRED_QUALITIES]
     status_message = None
     try:
         archived_ids = []
@@ -298,20 +456,34 @@ async def _finish_auto_channel_batch(client: Client, channel_id: int, session: d
             if not archived:
                 raise RuntimeError(f"Could not verify source message {source.id} in the archive")
             archived_ids.append(int(archived.id))
-            if position % 25 == 0:
-                logger.info("/getlinkauto channel %s: archived %s/%s", channel_id, position, len(messages))
+            logger.info(
+                "/getlinkauto channel %s: archived %s/%s for %s S%02d EP%02d",
+                channel_id, position, len(messages), completion["title"],
+                completion["season"], completion["episode"],
+            )
 
         manifest_id = await save_auto_batch_manifest(bot, bot.archive_channel_id, archived_ids)
         code = encode_batch_manifest_id(manifest_id)
+        if not code:
+            raise RuntimeError("Could not encode the three-file batch link")
         try:
             bot.state_store.database.record_link("batch_" + code, "batch_manifest", manifest_id)
         except Exception:
             logger.exception("Could not record /getlinkauto batch link metadata")
+
         url = f"https://t.me/{bot.username}?start=batch_{code}"
         auto_settings = _get_auto_detect_settings()
-        title, episodes = detect_auto_batch_metadata(messages, settings=auto_settings)
-        result_text = build_auto_batch_result(title, episodes, url, settings=auto_settings)
+        result_text = build_auto_batch_result(
+            completion["title"],
+            {completion["season"]: {completion["episode"]}},
+            url,
+            settings=auto_settings,
+        )
         status_message = await client.send_message(channel_id, result_text, parse_mode=None)
+
+        # Mark the episode complete only after the shareable link is published.
+        session["completed_episodes"].add(episode_key)
+        session["quality_groups"].pop(episode_key, None)
         try:
             await bot.state_store.update_stats(total_links=1, total_files=len(archived_ids))
         except Exception:
@@ -319,37 +491,40 @@ async def _finish_auto_channel_batch(client: Client, channel_id: int, session: d
 
         # Delete only after every source message and the one-link manifest are verified
         # and the final link post has been accepted by Telegram.
+        # Remove only the three uploaded source posts. The auto collector stays
+        # active so later episodes can each receive their own one-link batch.
         source_ids = [int(item.id) for item in messages]
-        if session.get("trigger_message_id"):
-            source_ids.append(int(session["trigger_message_id"]))
-        if session.get("prompt_message_id"):
-            source_ids.append(int(session["prompt_message_id"]))
-        delete_failed = []
+        delete_failed = False
         for offset in range(0, len(source_ids), 100):
             chunk = source_ids[offset:offset + 100]
             try:
                 await client.delete_messages(channel_id, chunk)
             except Exception:
-                logger.exception("Could not delete /getlinkauto source posts from channel %s", channel_id)
-                delete_failed.extend(chunk)
+                delete_failed = True
+                logger.exception("Could not delete /getlinkauto source files from channel %s", channel_id)
         if delete_failed and status_message:
-            await status_message.edit_text(
-                result_text + "\n\n⚠️ Some original posts could not be deleted. Check the bot's Delete Messages permission.",
-                parse_mode=None,
-            )
+            try:
+                await status_message.edit_text(
+                    result_text + "\n\n⚠️ The link is ready, but the original files could not be deleted.",
+                    parse_mode=None,
+                )
+            except Exception:
+                logger.exception("Could not update auto-link status message")
     except Exception as exc:
-        logger.exception("/getlinkauto failed for channel %s", channel_id)
+        logger.exception("/getlinkauto failed for %s S%02d EP%02d in channel %s", completion.get("title", ""), completion.get("season", 0), completion.get("episode", 0), channel_id)
+        # Keep the three source posts and their pending group. Re-sending one
+        # quality for the same episode retries the archive/link operation.
         try:
             await client.send_message(
                 channel_id,
-                f"❌ Auto batch was not completed: {exc}\nOriginal posts were kept. Please check archive-channel permissions and try again.",
+                f"❌ Could not finish {completion['title']} S{completion['season']:02d} "
+                f"EP{completion['episode']:02d}: {exc}\n"
+                "The three original files were kept. Send one of the quality files again to retry.",
                 parse_mode=None,
             )
         except Exception:
             logger.exception("Could not send /getlinkauto error message")
-    finally:
-        if AUTO_CHANNEL_SESSIONS.get(channel_id) is session:
-            AUTO_CHANNEL_SESSIONS.pop(channel_id, None)
+
 
 # ------------------- HELPER FUNCTIONS ------------------- #
 
@@ -359,12 +534,15 @@ def is_admin(user_id: int) -> bool:
     admins = bot.state_store.get_admins()
     return user_id in admins
 
+
 def is_owner(user_id: int) -> bool:
     return user_id == bot.settings.owner_id
+
 
 def _member_status_name(member) -> str:
     """Normalize Pyrogram enum/string statuses without assuming enum formatting."""
     return str(getattr(member, "status", "")).upper().split(".")[-1]
+
 
 def _is_joined_member(member) -> bool:
     # Pending requests are not membership. Restricted users count only if Telegram
@@ -376,6 +554,7 @@ def _is_joined_member(member) -> bool:
         return bool(getattr(member, "is_member", False))
     return False
 
+
 def _forwarded_channel(message: Message):
     """Return the channel chat from either legacy or modern Telegram forward metadata."""
     chat = getattr(message, "forward_from_chat", None)
@@ -383,6 +562,7 @@ def _forwarded_channel(message: Message):
         return chat
     origin = getattr(message, "forward_origin", None)
     return getattr(origin, "chat", None) if origin is not None else None
+
 
 async def _verify_bot_can_manage_invites(client: Client, channel_id: int):
     """Require the bot to be an admin/owner with invite-user permission."""
@@ -397,6 +577,7 @@ async def _verify_bot_can_manage_invites(client: Client, channel_id: int):
             raise PermissionError(
                 "I am an administrator, but I need the 'Invite Users via Link' permission."
             )
+
 
 async def check_fsub(client: Client, user_id: int) -> List[Dict]:
     """Return channels still required for FSUB verification.
@@ -433,6 +614,7 @@ async def check_fsub(client: Client, user_id: int) -> List[Dict]:
             logger.warning("FSUB membership check failed for %s: %s", chat_identifier, e)
             unjoined.append(ch)
     return unjoined
+
 
 async def _refresh_fsub_request_stats(client: Client, channel: Dict) -> None:
     """Reconcile saved requests with Telegram's current pending-request list.
@@ -487,6 +669,7 @@ async def _refresh_fsub_request_stats(client: Client, channel: Dict) -> None:
                 channel_id, requested_user_id, exc
             )
 
+
 def get_fsub_keyboard(unjoined: List[Dict], redirect_data: Optional[str] = None) -> InlineKeyboardMarkup:
     buttons = []
     for ch in unjoined:
@@ -497,6 +680,7 @@ def get_fsub_keyboard(unjoined: List[Dict], redirect_data: Optional[str] = None)
     try_again_data = f"try_again_{redirect_data}" if redirect_data else "try_again"
     buttons.append([InlineKeyboardButton(text="🔄 Try Again", callback_data=try_again_data)])
     return InlineKeyboardMarkup(buttons)
+
 
 # ------------------- COMMAND: /START ------------------- #
 
@@ -556,6 +740,7 @@ async def _deliver_start_payload(client: Client, user_id: int, message: Message,
         logger.warning("Start payload could not be delivered: %s", exc)
         await message.reply_text("❌ This link is corrupted, invalid, or expired.")
 
+
 async def _reply_configured_message(
     message: Message,
     content,
@@ -583,6 +768,7 @@ async def _reply_configured_message(
         text = text.replace("{" + key + "}", value)
     return await message.reply_text(text, reply_markup=reply_markup)
 
+
 def _admin_message_payload(message: Message):
     """Capture text or a Telegram photo+caption using Pyrogram's Photo shape.
 
@@ -609,6 +795,7 @@ def _admin_message_payload(message: Message):
     text = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
     return text or None
 
+
 async def _reply_welcome(message: Message, first_name: str = "there"):
     welcome = bot.state_store.get("welcome_message")
     kb = InlineKeyboardMarkup([
@@ -627,6 +814,7 @@ async def _reply_welcome(message: Message, first_name: str = "there"):
         reply_markup=kb,
         replacements={"user": first_name},
     )
+
 
 async def start_handler(client: Client, message: Message):
     user_id = message.from_user.id
@@ -656,17 +844,53 @@ async def start_handler(client: Client, message: Message):
         return await _deliver_start_payload(client, user_id, message, param)
     return await _reply_welcome(message, message.from_user.first_name)
 
+
 bot.on_message(filters.command("start") & filters.private)(start_handler)
+
 
 # ------------------- CHANNEL COMMAND: /GETLINKAUTO ------------------- #
 
 @bot.on_message(filters.command("getlinkauto") & filters.channel)
 async def getlinkauto_channel_handler(client: Client, message: Message):
     channel_id = int(message.chat.id)
-    # A channel post can only be authored by someone allowed to publish there.
-    # Telegram hides the individual admin identity for ordinary channel posts.
+
+    # Only configured bot admins may start or stop the collector.
     if message.from_user and not is_admin(int(message.from_user.id)):
         return
+
+    # Calling /getlinkauto again stops an active collector. This replaces a
+    # manual /done command while allowing the bot to collect any number of
+    # episodes during one run.
+    existing = AUTO_CHANNEL_SESSIONS.get(channel_id)
+    if existing and existing.get("status") == "collecting":
+        existing["status"] = "stopped"
+        AUTO_CHANNEL_SESSIONS.pop(channel_id, None)
+        ids_to_delete = [
+            int(value) for value in (
+                existing.get("trigger_message_id"),
+                existing.get("prompt_message_id"),
+            ) if value
+        ]
+        try:
+            if ids_to_delete:
+                await client.delete_messages(channel_id, ids_to_delete)
+        except Exception:
+            logger.exception("Could not remove /getlinkauto start messages after stopping")
+        return await client.send_message(
+            channel_id,
+            "🛑 Auto detection stopped. Completed episode links remain valid. "
+            "Any incomplete episode files were left in the channel.",
+            parse_mode=None,
+        )
+
+    settings = _get_auto_detect_settings()
+    if not settings.get("enabled", True):
+        return await client.send_message(
+            channel_id,
+            "⛔ Auto detection is disabled. Enable it in the admin panel first.",
+            parse_mode=None,
+        )
+
     try:
         me = await client.get_me()
         member = await client.get_chat_member(channel_id, me.id)
@@ -690,25 +914,25 @@ async def getlinkauto_channel_handler(client: Client, message: Message):
         logger.exception("Could not verify channel permissions for /getlinkauto")
         return await client.send_message(channel_id, f"❌ Could not verify my channel permissions: {exc}")
 
-    existing = AUTO_CHANNEL_SESSIONS.get(channel_id)
-    if existing and existing.get("status") in {"collecting", "processing"}:
-        return await client.send_message(channel_id, "⚠️ An automatic batch is already running in this channel. Wait for its link before starting another.")
     session = {
         "status": "collecting",
-        "messages": {},
         "quality_groups": {},
+        "completed_episodes": set(),
         "completion_lock": asyncio.Lock(),
         "trigger_message_id": int(message.id),
     }
     AUTO_CHANNEL_SESSIONS[channel_id] = session
     prompt = await client.send_message(
         channel_id,
-        "📥 **Auto batch collection started.** Send the same episode in `[480p]`, `[720p]`, and `[1080p]` quality. "
-        "I will detect the labels from each filename and automatically create one combined batch link "
-        "when all three qualities for that anime, season, and episode arrive. No timer is used.",
+        "📥 Auto detection is ON. Send episode files with [480p], [720p], and [1080p] in their filenames.\n\n"
+        "I match the anime title, season, and episode. As soon as all three qualities for an episode arrive, "
+        "I create one link containing exactly those 3 files.\n\n"
+        "You can send multiple episodes; each completed episode gets its own link. "
+        "No /done command and no timer. Send /getlinkauto again to stop.",
         parse_mode=None,
     )
     session["prompt_message_id"] = int(prompt.id)
+
 
 @bot.on_message(filters.channel & ~filters.command(["getlinkauto"]))
 async def getlinkauto_collect_channel_messages(client: Client, message: Message):
@@ -716,7 +940,6 @@ async def getlinkauto_collect_channel_messages(client: Client, message: Message)
     session = AUTO_CHANNEL_SESSIONS.get(channel_id)
     if not session or session.get("status") != "collecting":
         return
-    # Ignore bot-generated status/reply messages; only collect posts from the channel.
     if message.from_user and getattr(message.from_user, "is_bot", False):
         return
     if int(message.id) in {
@@ -724,29 +947,30 @@ async def getlinkauto_collect_channel_messages(client: Client, message: Message)
         int(session.get("prompt_message_id") or 0),
     }:
         return
-    # Serialize collection and completion so two fast Telegram updates cannot
-    # trigger the same batch twice or lose the third quality file.
+
     lock = session.setdefault("completion_lock", asyncio.Lock())
     async with lock:
         if AUTO_CHANNEL_SESSIONS.get(channel_id) is not session:
             return
         if session.get("status") != "collecting":
             return
-
-        session.setdefault("messages", {})[int(message.id)] = message
         settings = _get_auto_detect_settings()
-        completion = _record_auto_quality(session, message, settings)
+        if not settings.get("enabled", True):
+            return
 
-        if completion:
-            logger.info(
-                "/getlinkauto channel %s: detected all required qualities for %s S%02d EP%02d (%s)",
-                channel_id,
-                completion["title"],
-                completion["season"],
-                completion["episode"],
-                ", ".join(completion["qualities"]),
-            )
-            await _finish_auto_channel_batch(client, channel_id, session)
+        completion = _record_auto_quality(session, message, settings)
+        if not completion:
+            return
+
+        logger.info(
+            "/getlinkauto channel %s: all qualities received for %s S%02d EP%02d",
+            channel_id,
+            completion["title"],
+            completion["season"],
+            completion["episode"],
+        )
+        await _finish_auto_channel_batch(client, channel_id, session, completion)
+
 
 # ------------------- COMMAND: /GETLINK ------------------- #
 
@@ -779,6 +1003,7 @@ async def getlink_handler(client: Client, message: Message):
         "finish_lock": asyncio.Lock(),
     }
 
+
 # ------------------- COMMAND: /BATCH ------------------- #
 
 @bot.on_message(filters.command("batch") & filters.private)
@@ -792,6 +1017,7 @@ async def batch_cmd_handler(client: Client, message: Message):
         "1. Forward the **FIRST** message from the source channel or send its Telegram post link.\n"
         "Send /cancel to abort at any time."
     )
+
 
 # ------------------- COMMAND: /ADMIN & ADMIN FEATURES ------------------- #
 
@@ -817,6 +1043,7 @@ async def admin_panel(client: Client, message: Message):
     ])
     await message.reply_text(text, reply_markup=kb)
 
+
 @bot.on_message(filters.command("status") & filters.private)
 async def status_handler(client: Client, message: Message):
     if not is_admin(message.from_user.id):
@@ -830,6 +1057,7 @@ async def status_handler(client: Client, message: Message):
         f"• Total Files Copied: `{stats.get('total_files', 0)}`\n"
         f"• Total Link Views: `{stats.get('total_views', 0)}`"
     )
+
 
 @bot.on_message(filters.command("users") & filters.private)
 async def users_count_handler(client: Client, message: Message):
@@ -852,6 +1080,7 @@ async def users_count_handler(client: Client, message: Message):
     for start in range(0, len(lines), 35):
         await message.reply_text("\n".join(lines[start:start + 35]), parse_mode=None)
 
+
 @bot.on_message(filters.command("addadmin") & filters.private)
 async def add_admin_handler(client: Client, message: Message):
     if not is_owner(message.from_user.id):
@@ -861,6 +1090,7 @@ async def add_admin_handler(client: Client, message: Message):
         return await message.reply_text("Usage: `/addadmin <numeric_user_id>`")
     await bot.state_store.add_admin(int(args[1]))
     await message.reply_text("✅ Administrator added.")
+
 
 @bot.on_message(filters.command("deladmin") & filters.private)
 async def remove_admin_handler(client: Client, message: Message):
@@ -874,6 +1104,7 @@ async def remove_admin_handler(client: Client, message: Message):
         return await message.reply_text("⚠️ The owner and environment-configured admins cannot be removed here.")
     await bot.state_store.remove_admin(admin_id)
     await message.reply_text("✅ Administrator removed if they were present.")
+
 
 @bot.on_message(filters.command("broadcast") & filters.private)
 async def broadcast_handler(client: Client, message: Message):
@@ -908,6 +1139,7 @@ async def broadcast_handler(client: Client, message: Message):
         f"• Successful: `{success}`\n"
         f"• Failed: `{failed}`"
     )
+
 
 # ------------------- PRIVATE MESSAGE INTERCEPTOR ------------------- #
 
@@ -945,6 +1177,7 @@ async def _batch_endpoint(client: Client, message: Message):
     except Exception as exc:
         logger.info("Could not resolve batch source %s: %s", channel_id, exc)
         return None
+
 
 def _normalize_messages(result):
     """Normalize Telegram results and preserve original channel message order."""
@@ -991,7 +1224,6 @@ async def incoming_private_messages(client: Client, message: Message):
             settings["custom_regex"] = regex_value
             try:
                 normalize_auto_detect_settings(settings)
-                from helper.auto_detect_settings import get_auto_detect_pattern
                 get_auto_detect_pattern(settings)
             except Exception as exc:
                 return await message.reply_text(f"❌ Invalid regex: {exc}\nPlease send a valid regex or /cancel.")
@@ -1330,6 +1562,7 @@ async def incoming_private_messages(client: Client, message: Message):
             f"✅ **File Stored Permanently!**\n\n"
             f"🔗 Access Link:\n{file_url}"
         )
+
 
 # ------------------- CALLBACK QUERY HANDLERS ------------------- #
 
@@ -1803,11 +2036,13 @@ async def callback_router(client: Client, query: CallbackQuery):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="adm_fsub")]])
         )
 
+
 def register_handlers(app: Client):
     """Compatibility export; handlers are registered once by decorators above."""
     if app is not bot:
         raise ValueError("ANIFLIX handlers are bound to the configured bot client.")
     return True
+
 
 if __name__ == "__main__":
     bot.run()
