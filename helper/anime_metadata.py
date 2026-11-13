@@ -65,21 +65,21 @@ def _message_filename(message):
 
 
 def _clean_anime_title(title):
-    """Remove channel prefixes and release tags while keeping underscores."""
+    """Remove @channel prefixes, release tags, and underscores from the anime title."""
 
-    title = re.sub(r"^@\S+\s*-\s*", "", title.strip())
+    title = title.strip()
+
+    # Remove leading @channel_name separated by underscores, spaces, dots, or hyphens
+    title = re.sub(r"^@[A-Za-z0-9]+(?:[\s._\-]+|$)", "", title)
 
     # Remove bracketed release information
     title = re.sub(r"\[[^\]]*\]", " ", title)
     title = re.sub(r"\([^)]*\)", " ", title)
 
-    # Normalize spaces, dots, hyphens, and underscores into single underscores
-    title = re.sub(r"[\s.\-_]+", "_", title)
+    # Replace underscores, dots, hyphens, and multiple spaces with a single space
+    title = re.sub(r"[\s.\-_]+", " ", title)
 
-    # Strip leading/trailing underscores
-    title = title.strip("_")
-
-    return title.upper()
+    return title.strip().upper()
 
 
 def detect_auto_batch_metadata(messages):
