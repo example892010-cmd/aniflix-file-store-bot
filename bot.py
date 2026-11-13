@@ -56,9 +56,11 @@ logger = logging.getLogger("ANIFLIX-FILE-STORE-BOT")
 USER_UPLOAD_SESSIONS: Dict[int, Dict] = {}
 # In-memory tracking for /batch forwarding sessions
 USER_BATCH_SESSIONS: Dict[int, Dict] = {}
-# Channel-scoped /getlinkauto sessions. Collection ends when all three
-# required quality versions are received for the same anime/season/episode.
+# Channel-scoped /getlinkauto sessions.
 AUTO_CHANNEL_SESSIONS: Dict[int, Dict] = {}
+# Private-scoped /getlinkauto sessions.
+AUTO_PRIVATE_SESSIONS: Dict[int, Dict] = {}
+
 AUTO_REQUIRED_QUALITIES = frozenset({"480p", "720p", "1080p"})
 AUTO_QUALITY_RE = re.compile(
     r"(?<!\d)(480|720|1080)\s*p(?![A-Za-z0-9])",
@@ -67,14 +69,11 @@ AUTO_QUALITY_RE = re.compile(
 ADMIN_PENDING_ACTIONS: Dict[int, str] = {}
 ADMIN_PENDING_DATA: Dict[int, Dict] = {}
 
-
 def _get_archive_channel_id() -> int:
     return bot.settings.archive_channel_id
 
-
 def _get_admins() -> List[int]:
     return list(bot.settings.admins)
-
 
 class AniflixBot(Client):
     def __init__(self, settings=None):
@@ -88,12 +87,9 @@ class AniflixBot(Client):
         )
         self.archive_channel_id = self.settings.archive_channel_id
         self.state_store = StateStore(self, self.archive_channel_id, self.settings.sqlite_path)
-        # Keep Pyrogram Client.storage reserved for its internal MTProto session backend.
         self.file_storage = Storage(self, self.archive_channel_id, self.state_store.database)
         self.batch_reader = None
         if self.settings.batch_user_session_string:
-            # Optional user authorization is isolated to /batch source reads.
-            # Never log or persist the session string in project files.
             self.batch_reader = Client(
                 name=f"{self.settings.session_name}_batch_reader",
                 api_id=self.settings.api_id,
@@ -111,7 +107,6 @@ class AniflixBot(Client):
             me = await self.get_me()
             self.username = me.username
             logger.info(f"Bot started as @{self.username}")
-            # Initialize remote state safely without get_chat_history
             await self.state_store.load_state()
             logger.info("Bot state initialized successfully.")
         except Exception:
@@ -128,13 +123,10 @@ class AniflixBot(Client):
         self.state_store.close()
         logger.info("Bot stopped cleanly.")
 
-
 bot = AniflixBot()
-
 
 @bot.on_chat_member_updated(filters.channel)
 async def record_fsub_membership_update(client: Client, update):
-    """Count only Telegram membership updates, never button presses or requests."""
     try:
         channel_id = int(update.chat.id)
         old_member = getattr(update, "old_chat_member", None)
@@ -160,10 +152,8 @@ async def record_fsub_membership_update(client: Client, update):
     except Exception:
         logger.exception("Could not record FSUB membership update")
 
-
 @bot.on_chat_join_request(filters.channel)
 async def record_fsub_join_request(client: Client, request):
-    """Persist a user's request only when it used our configured FSUB invite."""
     try:
         channel_id = int(request.chat.id)
         user_id = int(request.from_user.id)
@@ -176,32 +166,18 @@ async def record_fsub_join_request(client: Client, request):
             )
             if configured_id != channel_id or not is_request_channel:
                 continue
-            # Do not count requests made through unrelated channel invite links.
             if not received_link or received_link != channel.get("link"):
-                logger.info(
-                    "Ignoring join request not made through the configured FSUB link "
-                    "(channel=%s, user=%s).", channel_id, user_id
-                )
                 return
             await bot.state_store.record_fsub_join_request(channel_id, user_id)
-            logger.info(
-                "Recorded FSUB join request (channel=%s, user=%s).",
-                channel_id, user_id
-            )
             return
     except Exception:
         logger.exception("Could not record incoming FSUB join request")
 
-
-# ------------------- CHANNEL AUTO-LINK HELPERS ------------------- #
-
-
+# ------------------- AUTO-LINK HELPERS ------------------- #
 
 def _get_auto_detect_settings():
-    """Read persisted auto-detection settings, falling back to safe defaults."""
     saved = bot.state_store.get("auto_detect_settings", get_default_auto_detect_settings())
     return normalize_auto_detect_settings(saved)
-
 
 def _auto_detect_settings_text():
     settings = _get_auto_detect_settings()
@@ -219,7 +195,6 @@ def _auto_detect_settings_text():
         "Choose a setting below. Changes are saved and used by the next `/getlinkauto` batch."
     )
 
-
 def _auto_detect_settings_keyboard():
     settings = _get_auto_detect_settings()
     toggle_label = "⏸ Disable Detection" if settings.get("enabled", True) else "▶️ Enable Detection"
@@ -234,9 +209,7 @@ def _auto_detect_settings_keyboard():
         [InlineKeyboardButton("🔙 Admin Panel", callback_data="adm_back")],
     ])
 
-
 def _auto_channel_message_filename(message) -> str:
-    """Return a Telegram media filename, falling back to caption or text."""
     for field in ("document", "video", "audio", "animation"):
         media = getattr(message, field, None)
         filename = getattr(media, "file_name", None) if media else None
@@ -244,9 +217,7 @@ def _auto_channel_message_filename(message) -> str:
             return str(filename)
     return str(getattr(message, "caption", None) or getattr(message, "text", None) or "")
 
-
 def _auto_message_quality_key(message, settings):
-    """Return ((normalized title, season, episode), quality) for a named file."""
     filename = _auto_channel_message_filename(message)
     if not filename:
         return None
@@ -255,7 +226,6 @@ def _auto_message_quality_key(message, settings):
     if not quality_match:
         return None
 
-    # Use the same configurable filename format as the metadata detector.
     try:
         from helper.auto_detect_settings import get_auto_detect_pattern
         episode_match = get_auto_detect_pattern(settings).search(filename)
@@ -274,9 +244,7 @@ def _auto_message_quality_key(message, settings):
     quality = f"{quality_match.group(1)}p".lower()
     return (title.casefold(), season, episode), quality
 
-
 def _record_auto_quality(session: dict, message, settings):
-    """Record a quality and return completion details once one episode has all 3."""
     parsed = _auto_message_quality_key(message, settings)
     if not parsed:
         return None
@@ -295,9 +263,7 @@ def _record_auto_quality(session: dict, message, settings):
         }
     return None
 
-
 async def _finish_auto_channel_batch(client: Client, channel_id: int, session: dict):
-    """Archive the completed quality set, publish one link, then remove source posts."""
     if AUTO_CHANNEL_SESSIONS.get(channel_id) is not session or session.get("status") != "collecting":
         return
     session["status"] = "processing"
@@ -313,8 +279,6 @@ async def _finish_auto_channel_batch(client: Client, channel_id: int, session: d
             if not archived:
                 raise RuntimeError(f"Could not verify source message {source.id} in the archive")
             archived_ids.append(int(archived.id))
-            if position % 25 == 0:
-                logger.info("/getlinkauto channel %s: archived %s/%s", channel_id, position, len(messages))
 
         manifest_id = await save_auto_batch_manifest(bot, bot.archive_channel_id, archived_ids)
         code = encode_batch_manifest_id(manifest_id)
@@ -332,8 +296,6 @@ async def _finish_auto_channel_batch(client: Client, channel_id: int, session: d
         except Exception:
             logger.exception("Could not update statistics after /getlinkauto success")
 
-        # Delete only after every source message and the one-link manifest are verified
-        # and the final link post has been accepted by Telegram.
         source_ids = [int(item.id) for item in messages]
         if session.get("trigger_message_id"):
             source_ids.append(int(session["trigger_message_id"]))
@@ -345,27 +307,57 @@ async def _finish_auto_channel_batch(client: Client, channel_id: int, session: d
             try:
                 await client.delete_messages(channel_id, chunk)
             except Exception:
-                logger.exception("Could not delete /getlinkauto source posts from channel %s", channel_id)
                 delete_failed.extend(chunk)
         if delete_failed and status_message:
             await status_message.edit_text(
-                result_text + "\n\n⚠️ Some original posts could not be deleted. Check the bot's Delete Messages permission.",
+                result_text + "\n\n⚠️ Some original posts could not be deleted.",
                 parse_mode=None,
             )
     except Exception as exc:
         logger.exception("/getlinkauto failed for channel %s", channel_id)
-        try:
-            await client.send_message(
-                channel_id,
-                f"❌ Auto batch was not completed: {exc}\nOriginal posts were kept. Please check archive-channel permissions and try again.",
-                parse_mode=None,
-            )
-        except Exception:
-            logger.exception("Could not send /getlinkauto error message")
     finally:
         if AUTO_CHANNEL_SESSIONS.get(channel_id) is session:
             AUTO_CHANNEL_SESSIONS.pop(channel_id, None)
 
+async def _finish_auto_private_batch(client: Client, user_id: int, session: dict):
+    if AUTO_PRIVATE_SESSIONS.get(user_id) is not session or session.get("status") != "collecting":
+        return
+    session["status"] = "processing"
+    messages = sorted(session.get("messages", {}).values(), key=lambda item: int(item.id))
+    if not messages:
+        AUTO_PRIVATE_SESSIONS.pop(user_id, None)
+        return
+    try:
+        archived_ids = []
+        for source in messages:
+            archived = await bot.file_storage.store_message(source)
+            if not archived:
+                raise RuntimeError(f"Could not verify source message {source.id} in the archive")
+            archived_ids.append(int(archived.id))
+
+        manifest_id = await save_auto_batch_manifest(bot, bot.archive_channel_id, archived_ids)
+        code = encode_batch_manifest_id(manifest_id)
+        try:
+            bot.state_store.database.record_link("batch_" + code, "batch_manifest", manifest_id)
+        except Exception:
+            logger.exception("Could not record private /getlinkauto batch link metadata")
+        
+        url = f"https://t.me/{bot.username}?start=batch_{code}"
+        auto_settings = _get_auto_detect_settings()
+        title, episodes = detect_auto_batch_metadata(messages, settings=auto_settings)
+        result_text = build_auto_batch_result(title, episodes, url, settings=auto_settings)
+        
+        await client.send_message(user_id, "🎉 **All 3 Qualities Received! Combined Batch Link Generated:**\n\n" + result_text, parse_mode=None)
+        try:
+            await bot.state_store.update_stats(total_links=1, total_files=len(archived_ids))
+        except Exception:
+            logger.exception("Could not update statistics after private /getlinkauto success")
+    except Exception as exc:
+        logger.exception("Private /getlinkauto failed for user %s", user_id)
+        await client.send_message(user_id, f"❌ Auto batch could not be completed: {exc}")
+    finally:
+        if AUTO_PRIVATE_SESSIONS.get(user_id) is session:
+            AUTO_PRIVATE_SESSIONS.pop(user_id, None)
 
 # ------------------- HELPER FUNCTIONS ------------------- #
 
@@ -375,19 +367,13 @@ def is_admin(user_id: int) -> bool:
     admins = bot.state_store.get_admins()
     return user_id in admins
 
-
 def is_owner(user_id: int) -> bool:
     return user_id == bot.settings.owner_id
 
-
 def _member_status_name(member) -> str:
-    """Normalize Pyrogram enum/string statuses without assuming enum formatting."""
     return str(getattr(member, "status", "")).upper().split(".")[-1]
 
-
 def _is_joined_member(member) -> bool:
-    # Pending requests are not membership. Restricted users count only if Telegram
-    # explicitly reports is_member=True.
     status = _member_status_name(member)
     if status in {"MEMBER", "ADMINISTRATOR", "OWNER", "CREATOR"}:
         return True
@@ -395,18 +381,14 @@ def _is_joined_member(member) -> bool:
         return bool(getattr(member, "is_member", False))
     return False
 
-
 def _forwarded_channel(message: Message):
-    """Return the channel chat from either legacy or modern Telegram forward metadata."""
     chat = getattr(message, "forward_from_chat", None)
     if chat is not None:
         return chat
     origin = getattr(message, "forward_origin", None)
     return getattr(origin, "chat", None) if origin is not None else None
 
-
 async def _verify_bot_can_manage_invites(client: Client, channel_id: int):
-    """Require the bot to be an admin/owner with invite-user permission."""
     bot_identity = await client.get_me()
     bot_member = await client.get_chat_member(channel_id, bot_identity.id)
     status = _member_status_name(bot_member)
@@ -415,23 +397,10 @@ async def _verify_bot_can_manage_invites(client: Client, channel_id: int):
     if status != "OWNER":
         privileges = getattr(bot_member, "privileges", None)
         if not privileges or not getattr(privileges, "can_invite_users", False):
-            raise PermissionError(
-                "I am an administrator, but I need the 'Invite Users via Link' permission."
-            )
-
+            raise PermissionError("I need the 'Invite Users via Link' permission.")
 
 async def check_fsub(client: Client, user_id: int) -> List[Dict]:
-    """Return channels still required for FSUB verification.
-
-    Normal-join and join-request channels both require confirmed Telegram
-    membership. A recorded join request is pending evidence only and never
-    grants access before an administrator accepts it.
-    """
-    # The persisted admin-managed list is authoritative. In particular, an
-    # empty list means FSUB is disabled; never resurrect removed channels from
-    # legacy config defaults.
     fsub_channels = bot.state_store.get_fsub_channels()
-
     unjoined = []
     for ch in fsub_channels:
         chat_identifier = ch.get("id") or ch.get("username")
@@ -456,14 +425,7 @@ async def check_fsub(client: Client, user_id: int) -> List[Dict]:
             unjoined.append(ch)
     return unjoined
 
-
 async def _refresh_fsub_request_stats(client: Client, channel: Dict) -> None:
-    """Reconcile saved requests with Telegram's current pending-request list.
-
-    A request no longer pending and not a confirmed member is counted as closed
-    (declined or withdrawn); Telegram does not expose which of those occurred.
-    This is read-only: the bot never approves or declines requests.
-    """
     channel_id = int(channel.get("id") or 0)
     if not channel_id or not hasattr(client, "get_chat_join_requests"):
         return
@@ -505,11 +467,7 @@ async def _refresh_fsub_request_stats(client: Client, channel: Dict) -> None:
                 channel_id, requested_user_id
             )
         except Exception as exc:
-            logger.debug(
-                "Could not resolve FSUB request status for channel=%s user=%s: %s",
-                channel_id, requested_user_id, exc
-            )
-
+            logger.debug("Could not resolve FSUB request status: %s", exc)
 
 def get_fsub_keyboard(unjoined: List[Dict], redirect_data: Optional[str] = None) -> InlineKeyboardMarkup:
     buttons = []
@@ -522,11 +480,9 @@ def get_fsub_keyboard(unjoined: List[Dict], redirect_data: Optional[str] = None)
     buttons.append([InlineKeyboardButton(text="🔄 Try Again", callback_data=try_again_data)])
     return InlineKeyboardMarkup(buttons)
 
-
 # ------------------- COMMAND: /START ------------------- #
 
 async def _deliver_start_payload(client: Client, user_id: int, message: Message, param: str):
-    """Deliver a single file, a new ordered manifest, or a legacy bounded range."""
     try:
         if param.startswith("batch_"):
             payload = param[6:]
@@ -565,10 +521,6 @@ async def _deliver_start_payload(client: Client, user_id: int, message: Message,
             await bot.state_store.update_stats(total_views=1)
             if sent_count == 0:
                 return await message.reply_text("❌ No files in this batch are available.")
-            if failed_count:
-                await message.reply_text(
-                    f"⚠️ Legacy batch delivered: `{sent_count}` files; `{failed_count}` unavailable."
-                )
             return
 
         message_id = decode_message_id(param)
@@ -581,7 +533,6 @@ async def _deliver_start_payload(client: Client, user_id: int, message: Message,
         logger.warning("Start payload could not be delivered: %s", exc)
         await message.reply_text("❌ This link is corrupted, invalid, or expired.")
 
-
 async def _reply_configured_message(
     message: Message,
     content,
@@ -590,7 +541,6 @@ async def _reply_configured_message(
     reply_markup=None,
     replacements: Optional[Dict[str, str]] = None,
 ):
-    """Reply with a saved text or photo+caption message (legacy text is supported)."""
     if not content:
         content = default_text
 
@@ -609,17 +559,9 @@ async def _reply_configured_message(
         text = text.replace("{" + key + "}", value)
     return await message.reply_text(text, reply_markup=reply_markup)
 
-
 def _admin_message_payload(message: Message):
-    """Capture text or a Telegram photo+caption using Pyrogram's Photo shape.
-
-    Pyrogram/Pyrofork exposes ``message.photo`` as one Photo object with a
-    ``file_id``. Some compatible wrappers expose a list of PhotoSize objects;
-    accept both shapes so the admin flow does not silently lose the image.
-    """
     photo = getattr(message, "photo", None)
     if photo:
-        # Pyrogram/Pyrofork: one Photo object. Compatibility: list/tuple of sizes.
         if isinstance(photo, (list, tuple)):
             photo = next(
                 (item for item in reversed(photo) if getattr(item, "file_id", None)),
@@ -636,7 +578,6 @@ def _admin_message_payload(message: Message):
     text = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
     return text or None
 
-
 async def _reply_welcome(message: Message, first_name: str = "there"):
     welcome = bot.state_store.get("welcome_message")
     kb = InlineKeyboardMarkup([
@@ -646,7 +587,7 @@ async def _reply_welcome(message: Message, first_name: str = "there"):
     default_text = (
         f"👋 Hello, **{first_name}**!\n\n"
         "Welcome to **ANIFLIX FILE STORE BOT**.\n"
-        "Send me media or use `/getlink` and `/batch` to store and generate sharing links."
+        "Send me media or use `/getlink`, `/getlinkauto`, and `/batch` to store and generate sharing links."
     )
     return await _reply_configured_message(
         message,
@@ -655,7 +596,6 @@ async def _reply_welcome(message: Message, first_name: str = "there"):
         reply_markup=kb,
         replacements={"user": first_name},
     )
-
 
 async def start_handler(client: Client, message: Message):
     user_id = message.from_user.id
@@ -685,17 +625,36 @@ async def start_handler(client: Client, message: Message):
         return await _deliver_start_payload(client, user_id, message, param)
     return await _reply_welcome(message, message.from_user.first_name)
 
-
 bot.on_message(filters.command("start") & filters.private)(start_handler)
 
+# ------------------- PRIVATE COMMAND: /GETLINKAUTO ------------------- #
+
+@bot.on_message(filters.command("getlinkauto") & filters.private)
+async def getlinkauto_private_handler(client: Client, message: Message):
+    user_id = message.from_user.id
+    if user_id in USER_UPLOAD_SESSIONS:
+        return await message.reply_text("⚠️ You already have an active upload session. Finish or cancel it first.")
+    
+    AUTO_PRIVATE_SESSIONS[user_id] = {
+        "status": "collecting",
+        "messages": {},
+        "quality_groups": {},
+        "completion_lock": asyncio.Lock(),
+    }
+    await message.reply_text(
+        "🧠 **Auto-Batch Collection Started (Private Mode)**\n\n"
+        "Send the 3 quality files (`480p`, `720p`, `1080p`) for your anime episode "
+        "(e.g., `@ANIFLIXANIMETAMIL - OverGeared S01 Ep07 [480p] [...]`).\n\n"
+        "As soon as all 3 qualities are received, I will automatically archive them and send you **one combined batch link**!\n\n"
+        "Send `/cancel` to abort.",
+        parse_mode=None
+    )
 
 # ------------------- CHANNEL COMMAND: /GETLINKAUTO ------------------- #
 
 @bot.on_message(filters.command("getlinkauto") & filters.channel)
 async def getlinkauto_channel_handler(client: Client, message: Message):
     channel_id = int(message.chat.id)
-    # A channel post can only be authored by someone allowed to publish there.
-    # Telegram hides the individual admin identity for ordinary channel posts.
     if message.from_user and not is_admin(int(message.from_user.id)):
         return
     try:
@@ -709,21 +668,14 @@ async def getlinkauto_channel_handler(client: Client, message: Message):
                 channel_id,
                 "⛔ Promote me as a channel administrator with **Post Messages** and **Delete Messages** permissions to use /getlinkauto.",
             )
-        if not owner_status and (
-            not getattr(privileges, "can_delete_messages", False)
-            or not getattr(privileges, "can_post_messages", False)
-        ):
-            return await client.send_message(
-                channel_id,
-                "⛔ I need both **Post Messages** and **Delete Messages** permissions to use /getlinkauto.",
-            )
     except Exception as exc:
         logger.exception("Could not verify channel permissions for /getlinkauto")
         return await client.send_message(channel_id, f"❌ Could not verify my channel permissions: {exc}")
 
     existing = AUTO_CHANNEL_SESSIONS.get(channel_id)
     if existing and existing.get("status") in {"collecting", "processing"}:
-        return await client.send_message(channel_id, "⚠️ An automatic batch is already running in this channel. Wait for its link before starting another.")
+        return await client.send_message(channel_id, "⚠️ An automatic batch is already running in this channel.")
+    
     session = {
         "status": "collecting",
         "messages": {},
@@ -734,13 +686,12 @@ async def getlinkauto_channel_handler(client: Client, message: Message):
     AUTO_CHANNEL_SESSIONS[channel_id] = session
     prompt = await client.send_message(
         channel_id,
-        "📥 **Auto batch collection started.** Send the same episode in `[480p]`, `[720p]`, and `[1080p]` quality. "
+        "📥 **Auto batch collection started.** Send the episode in `480p`, `720p`, and `1080p` quality. "
         "I will detect the labels from each filename and automatically create one combined batch link "
-        "when all three qualities for that anime, season, and episode arrive. No timer is used.",
+        "when all three qualities arrive.",
         parse_mode=None,
     )
     session["prompt_message_id"] = int(prompt.id)
-
 
 @bot.on_message(filters.channel & ~filters.command(["getlinkauto"]))
 async def getlinkauto_collect_channel_messages(client: Client, message: Message):
@@ -748,7 +699,6 @@ async def getlinkauto_collect_channel_messages(client: Client, message: Message)
     session = AUTO_CHANNEL_SESSIONS.get(channel_id)
     if not session or session.get("status") != "collecting":
         return
-    # Ignore bot-generated status/reply messages; only collect posts from the channel.
     if message.from_user and getattr(message.from_user, "is_bot", False):
         return
     if int(message.id) in {
@@ -756,13 +706,10 @@ async def getlinkauto_collect_channel_messages(client: Client, message: Message)
         int(session.get("prompt_message_id") or 0),
     }:
         return
-    # Serialize collection and completion so two fast Telegram updates cannot
-    # trigger the same batch twice or lose the third quality file.
+    
     lock = session.setdefault("completion_lock", asyncio.Lock())
     async with lock:
-        if AUTO_CHANNEL_SESSIONS.get(channel_id) is not session:
-            return
-        if session.get("status") != "collecting":
+        if AUTO_CHANNEL_SESSIONS.get(channel_id) is not session or session.get("status") != "collecting":
             return
 
         session.setdefault("messages", {})[int(message.id)] = message
@@ -770,16 +717,7 @@ async def getlinkauto_collect_channel_messages(client: Client, message: Message)
         completion = _record_auto_quality(session, message, settings)
 
         if completion:
-            logger.info(
-                "/getlinkauto channel %s: detected all required qualities for %s S%02d EP%02d (%s)",
-                channel_id,
-                completion["title"],
-                completion["season"],
-                completion["episode"],
-                ", ".join(completion["qualities"]),
-            )
             await _finish_auto_channel_batch(client, channel_id, session)
-
 
 # ------------------- COMMAND: /GETLINK ------------------- #
 
@@ -812,7 +750,6 @@ async def getlink_handler(client: Client, message: Message):
         "finish_lock": asyncio.Lock(),
     }
 
-
 # ------------------- COMMAND: /BATCH ------------------- #
 
 @bot.on_message(filters.command("batch") & filters.private)
@@ -826,7 +763,6 @@ async def batch_cmd_handler(client: Client, message: Message):
         "1. Forward the **FIRST** message from the source channel or send its Telegram post link.\n"
         "Send /cancel to abort at any time."
     )
-
 
 # ------------------- COMMAND: /ADMIN & ADMIN FEATURES ------------------- #
 
@@ -852,69 +788,6 @@ async def admin_panel(client: Client, message: Message):
     ])
     await message.reply_text(text, reply_markup=kb)
 
-
-@bot.on_message(filters.command("status") & filters.private)
-async def status_handler(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    stats = bot.state_store.get_stats()
-    await message.reply_text(
-        f"📊 **Bot Status & Health**\n\n"
-        f"• Status: `Online & Running`\n"
-        f"• Registered Users: `{stats.get('total_users', 0)}`\n"
-        f"• Total Links Created: `{stats.get('total_links', 0)}`\n"
-        f"• Total Files Copied: `{stats.get('total_files', 0)}`\n"
-        f"• Total Link Views: `{stats.get('total_views', 0)}`"
-    )
-
-
-@bot.on_message(filters.command("users") & filters.private)
-async def users_count_handler(client: Client, message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    users = sorted({int(uid) for uid in bot.state_store.get("users", [])})
-    profiles = bot.state_store.get("user_profiles", {})
-    if not users:
-        return await message.reply_text("👥 No registered users yet.")
-    await message.reply_text(f"👥 Registered Users: {len(users)}\nShowing saved user names:", parse_mode=None)
-    lines = []
-    for number, uid in enumerate(users, start=1):
-        profile = profiles.get(str(uid), {}) if isinstance(profiles, dict) else {}
-        name = " ".join(part for part in [profile.get("first_name", ""), profile.get("last_name", "")] if part).strip()
-        username = profile.get("username", "")
-        display = name or "Name unavailable (older registration)"
-        if username:
-            display += f" (@{username.lstrip('@')})"
-        lines.append(f"{number}. {display} — ID: {uid}")
-    for start in range(0, len(lines), 35):
-        await message.reply_text("\n".join(lines[start:start + 35]), parse_mode=None)
-
-
-@bot.on_message(filters.command("addadmin") & filters.private)
-async def add_admin_handler(client: Client, message: Message):
-    if not is_owner(message.from_user.id):
-        return await message.reply_text("⛔ Only the configured owner can manage extra administrators.")
-    args = getattr(message, "command", []) or []
-    if len(args) != 2 or not args[1].isdigit() or int(args[1]) <= 0:
-        return await message.reply_text("Usage: `/addadmin <numeric_user_id>`")
-    await bot.state_store.add_admin(int(args[1]))
-    await message.reply_text("✅ Administrator added.")
-
-
-@bot.on_message(filters.command("deladmin") & filters.private)
-async def remove_admin_handler(client: Client, message: Message):
-    if not is_owner(message.from_user.id):
-        return await message.reply_text("⛔ Only the configured owner can manage extra administrators.")
-    args = getattr(message, "command", []) or []
-    if len(args) != 2 or not args[1].isdigit() or int(args[1]) <= 0:
-        return await message.reply_text("Usage: `/deladmin <numeric_user_id>`")
-    admin_id = int(args[1])
-    if admin_id == bot.settings.owner_id or admin_id in bot.settings.admins:
-        return await message.reply_text("⚠️ The owner and environment-configured admins cannot be removed here.")
-    await bot.state_store.remove_admin(admin_id)
-    await message.reply_text("✅ Administrator removed if they were present.")
-
-
 @bot.on_message(filters.command("broadcast") & filters.private)
 async def broadcast_handler(client: Client, message: Message):
     if not is_admin(message.from_user.id):
@@ -925,8 +798,7 @@ async def broadcast_handler(client: Client, message: Message):
 
     users = bot.state_store.get("users", [])
     status_msg = await message.reply_text(f"🚀 Broadcasting to `{len(users)}` users...")
-    success = 0
-    failed = 0
+    success = failed = 0
 
     for uid in users:
         try:
@@ -943,17 +815,11 @@ async def broadcast_handler(client: Client, message: Message):
         except Exception:
             failed += 1
 
-    await status_msg.edit_text(
-        f"✅ **Broadcast Completed**\n\n"
-        f"• Successful: `{success}`\n"
-        f"• Failed: `{failed}`"
-    )
-
+    await status_msg.edit_text(f"✅ **Broadcast Completed**\n• Successful: `{success}`\n• Failed: `{failed}`")
 
 # ------------------- PRIVATE MESSAGE INTERCEPTOR ------------------- #
 
 async def _batch_endpoint(client: Client, message: Message):
-    """Resolve a forwarded channel post or Telegram post URL to (chat ID, msg ID)."""
     forwarded_chat = getattr(message, "forward_from_chat", None)
     forwarded_id = getattr(message, "forward_from_message_id", None)
     if forwarded_chat and forwarded_id:
@@ -987,9 +853,7 @@ async def _batch_endpoint(client: Client, message: Message):
         logger.info("Could not resolve batch source %s: %s", channel_id, exc)
         return None
 
-
 def _normalize_messages(result):
-    """Normalize Telegram results and preserve original channel message order."""
     if isinstance(result, (list, tuple)):
         messages = [item for item in result if item and not getattr(item, "empty", False)]
     elif result is None or getattr(result, "empty", False):
@@ -998,16 +862,60 @@ def _normalize_messages(result):
         messages = [result]
     return sorted(messages, key=lambda item: int(item.id))
 
-@bot.on_message(filters.private & ~filters.command(["start", "admin", "getlink", "batch", "broadcast", "users", "status"]))
+@bot.on_message(filters.private & ~filters.command(["start", "admin", "getlink", "batch", "broadcast", "users", "status", "getlinkauto"]))
 async def incoming_private_messages(client: Client, message: Message):
     user_id = message.from_user.id
 
+    # Handle /cancel command
+    if message.text and message.text.split(maxsplit=1)[0].split("@")[0] == "/cancel":
+        if user_id in AUTO_PRIVATE_SESSIONS:
+            AUTO_PRIVATE_SESSIONS.pop(user_id, None)
+            return await message.reply_text("❌ Auto-batch collection session cancelled.")
+        if USER_BATCH_SESSIONS.pop(user_id, None) is not None:
+            return await message.reply_text("❌ Batch process cancelled.")
+        if USER_UPLOAD_SESSIONS.pop(user_id, None) is not None:
+            return await message.reply_text("❌ Upload session cancelled.")
+
+    # Handle Private /getlinkauto session
+    if user_id in AUTO_PRIVATE_SESSIONS:
+        session = AUTO_PRIVATE_SESSIONS[user_id]
+        if session.get("status") == "collecting":
+            filename = _auto_channel_message_filename(message)
+            if not filename and not message.media:
+                return await message.reply_text("⚠️ Please send the quality media files (480p, 720p, 1080p) with their filenames.")
+            
+            lock = session.setdefault("completion_lock", asyncio.Lock())
+            async with lock:
+                if AUTO_PRIVATE_SESSIONS.get(user_id) is not session or session.get("status") != "collecting":
+                    return
+
+                session.setdefault("messages", {})[int(message.id)] = message
+                settings = _get_auto_detect_settings()
+                completion = _record_auto_quality(session, message, settings)
+
+                if completion:
+                    await message.reply_text(
+                        f"✅ Received all 3 qualities (`480p`, `720p`, `1080p`) for **{completion['title']}** S{completion['season']:02d} Ep{completion['episode']:02d}! Generating combined batch link..."
+                    )
+                    await _finish_auto_private_batch(client, user_id, session)
+                else:
+                    parsed = _auto_message_quality_key(message, settings)
+                    if parsed:
+                        _, quality = parsed
+                        received = session["quality_groups"].get(parsed[0], set())
+                        await message.reply_text(
+                            f"📥 Received **{quality.upper()}** quality file.\n"
+                            f"Qualities collected for this episode: `{', '.join(sorted(received))}` / `480p, 720p, 1080p`"
+                        )
+                    else:
+                        await message.reply_text(
+                            "⚠️ File received, but could not detect resolution (`480p`, `720p`, or `1080p`) or episode number from filename. Make sure your filename follows the format (e.g. `... S01 Ep07 [720p] ...`)."
+                        )
+            return
+
+    # Handle Admin Actions
     action = ADMIN_PENDING_ACTIONS.get(user_id)
     if action:
-        if message.text and message.text.split(maxsplit=1)[0].split("@")[0] == "/cancel":
-            ADMIN_PENDING_ACTIONS.pop(user_id, None)
-            ADMIN_PENDING_DATA.pop(user_id, None)
-            return await message.reply_text("❌ Admin edit cancelled.")
         if not is_admin(user_id):
             ADMIN_PENDING_ACTIONS.pop(user_id, None)
             ADMIN_PENDING_DATA.pop(user_id, None)
@@ -1015,191 +923,16 @@ async def incoming_private_messages(client: Client, message: Message):
         if action == "autodetect_title":
             title_value = (message.text or message.caption or "").strip()
             if not title_value:
-                return await message.reply_text("Send a title, `auto`, or /cancel.")
+                return await message.reply_text("Send a title or `auto`.")
             settings = _get_auto_detect_settings()
             settings["manual_title"] = "" if title_value.lower() == "auto" else title_value[:150]
             await save_auto_detect_settings_to_store(bot.state_store, settings)
             ADMIN_PENDING_ACTIONS.pop(user_id, None)
-            return await message.reply_text(
-                "✅ Anime title override cleared." if not settings["manual_title"] else "✅ Anime title override saved."
-            )
+            return await message.reply_text("✅ Anime title override saved.")
 
-        if action == "autodetect_regex":
-            regex_value = (message.text or message.caption or "").strip()
-            if not regex_value:
-                return await message.reply_text("Send a regex with named `season` and `episode` groups, or /cancel.")
-            settings = _get_auto_detect_settings()
-            settings["format"] = "CUSTOM"
-            settings["custom_regex"] = regex_value
-            try:
-                normalize_auto_detect_settings(settings)
-                from helper.auto_detect_settings import get_auto_detect_pattern
-                get_auto_detect_pattern(settings)
-            except Exception as exc:
-                return await message.reply_text(f"❌ Invalid regex: {exc}\nPlease send a valid regex or /cancel.")
-            await save_auto_detect_settings_to_store(bot.state_store, settings)
-            ADMIN_PENDING_ACTIONS.pop(user_id, None)
-            return await message.reply_text("✅ Custom filename regex saved and enabled.")
-
-        if action == "autodetect_test":
-            sample_text = (message.text or message.caption or "").strip()
-            if not sample_text:
-                return await message.reply_text("Send sample filenames, one per line, or /cancel.")
-            from types import SimpleNamespace
-            sample_messages = [
-                SimpleNamespace(document=SimpleNamespace(file_name=line.strip()), caption=None, text=None)
-                for line in sample_text.splitlines() if line.strip()
-            ]
-            settings = _get_auto_detect_settings()
-            detected_title, detected_episodes = detect_auto_batch_metadata(sample_messages, settings=settings)
-            qualities = get_auto_batch_qualities(sample_messages)
-            preview = build_auto_detection_preview(
-                detected_title, detected_episodes, qualities=qualities, settings=settings
-            )
-            ADMIN_PENDING_ACTIONS.pop(user_id, None)
-            return await message.reply_text(
-                "🧪 **AUTO DETECTION TEST**\n\n" + preview,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Auto Detect Settings", callback_data="adm_autodetect")]]),
-                parse_mode=None,
-            )
-
-        if action == "fsub_add_forward":
-            channel = _forwarded_channel(message)
-            if channel is None:
-                return await message.reply_text(
-                    "⚠️ I couldn't identify a forwarded channel. Please forward a message "
-                    "directly from the channel after making me an administrator there."
-                )
-            channels = list(bot.state_store.get_fsub_channels())
-            if len(channels) >= 10:
-                ADMIN_PENDING_ACTIONS.pop(user_id, None)
-                return await message.reply_text("⚠️ The maximum of 10 FSUB channels is already configured.")
-            try:
-                await _verify_bot_can_manage_invites(client, int(channel.id))
-                chat = await client.get_chat(int(channel.id))
-            except Exception as exc:
-                logger.warning("FSUB channel validation failed for %s: %s", getattr(channel, "id", "?"), exc)
-                return await message.reply_text(
-                    f"❌ Channel verification failed: `{exc}`\n\n"
-                    "Make sure I am an administrator and have permission to invite users."
-                )
-            if any(int(item.get("id", 0) or 0) == int(chat.id) for item in channels):
-                ADMIN_PENDING_ACTIONS.pop(user_id, None)
-                ADMIN_PENDING_DATA.pop(user_id, None)
-                return await message.reply_text("⚠️ This channel is already in the FSUB list.")
-            ADMIN_PENDING_DATA[user_id] = {
-                "id": int(chat.id),
-                "name": chat.title or "Channel",
-                "username": getattr(chat, "username", None),
-            }
-            ADMIN_PENDING_ACTIONS[user_id] = "fsub_choose_method"
-            return await message.reply_text(
-                f"✅ Channel verified: **{chat.title or 'Channel'}**\n"
-                f"🆔 `{chat.id}`\n\nChoose the force-subscription method:",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📨 JOIN REQUEST", callback_data="adm_fsub_method_request")],
-                    [InlineKeyboardButton("👥 NORMAL JOIN", callback_data="adm_fsub_method_normal")],
-                    [InlineKeyboardButton("❌ CANCEL", callback_data="adm_fsub")]
-                ])
-            )
-
-        if action == "fsub_choose_method":
-            return await message.reply_text(
-                "Please choose JOIN REQUEST or NORMAL JOIN using the buttons above, or /cancel."
-            )
-
-        if action == "fsub_edit_select":
-            if not message.text or not message.text.strip().isdigit():
-                return await message.reply_text("Send the channel number from the list, or /cancel.")
-            channels = list(bot.state_store.get_fsub_channels())
-            index = int(message.text.strip()) - 1
-            if index < 0 or index >= len(channels):
-                return await message.reply_text("No FSUB channel has that number.")
-            selected = channels[index]
-            ADMIN_PENDING_DATA[user_id] = {"fsub_edit_channel_id": int(selected.get("id") or 0)}
-            ADMIN_PENDING_ACTIONS[user_id] = "fsub_edit_name"
-            return await message.reply_text(
-                f"Send the new display name for **{selected.get('name', 'Channel')}** "
-                "(maximum 100 characters), or /cancel."
-            )
-
-        if action == "fsub_edit_name":
-            new_name = (message.text or "").strip()
-            pending = ADMIN_PENDING_DATA.get(user_id, {})
-            channel_id = int(pending.get("fsub_edit_channel_id") or 0)
-            if not new_name or len(new_name) > 100:
-                return await message.reply_text("Send a display name between 1 and 100 characters.")
-            channels = list(bot.state_store.get_fsub_channels())
-            selected = next((item for item in channels if int(item.get("id") or 0) == channel_id), None)
-            if not selected:
-                ADMIN_PENDING_ACTIONS.pop(user_id, None)
-                ADMIN_PENDING_DATA.pop(user_id, None)
-                return await message.reply_text("That FSUB channel is no longer configured.")
-            selected["name"] = new_name
-            await bot.state_store.set_fsub_channels(channels)
-            ADMIN_PENDING_ACTIONS.pop(user_id, None)
-            ADMIN_PENDING_DATA.pop(user_id, None)
-            return await message.reply_text("✅ FSUB channel display name updated.")
-
-        value = _admin_message_payload(message)
-        if value is None:
-            return await message.reply_text(
-                "⚠️ Send text, or send a photo with its caption, or /cancel."
-            )
-
-        if action == "welcome":
-            await bot.state_store.set("welcome_message", value)
-            ADMIN_PENDING_ACTIONS.pop(user_id, None)
-            return await message.reply_text("✅ Welcome message updated (photo and caption are supported).")
-        if action == "fsub_message":
-            await bot.state_store.set("fsub_message", value)
-            ADMIN_PENDING_ACTIONS.pop(user_id, None)
-            return await message.reply_text("✅ Force-subscription message updated (photo and caption are supported).")
-        if action == "fsub_clear_counts":
-            if not value.isdigit():
-                return await message.reply_text("Send the channel number from the list, or /cancel.")
-            channels = list(bot.state_store.get_fsub_channels())
-            index = int(value) - 1
-            if index < 0 or index >= len(channels):
-                return await message.reply_text("⚠️ No FSUB channel has that number.")
-            channel = channels[index]
-            ADMIN_PENDING_ACTIONS.pop(user_id, None)
-            ADMIN_PENDING_DATA[user_id] = {"fsub_clear_channel_id": int(channel.get("id") or 0)}
-            return await message.reply_text(
-                f"⚠️ Clear statistics for **{channel.get('name', 'Channel')}**?\n"
-                "This clears only the displayed counts. It does NOT remove saved join-request access records.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🧹 YES, CLEAR COUNTS", callback_data="adm_fsub_clear_confirm"),
-                     InlineKeyboardButton("❌ CANCEL", callback_data="adm_fsub_clear_cancel")]
-                ])
-            )
-
-        if action == "fsub_remove":
-            if not value.isdigit():
-                return await message.reply_text("Send the 1-based channel number to remove, or /cancel.")
-            channels = list(bot.state_store.get_fsub_channels())
-            index = int(value) - 1
-            if index < 0 or index >= len(channels):
-                return await message.reply_text("⚠️ No FSUB channel has that number.")
-            removed_channel = channels[index]
-            await bot.state_store.remove_fsub_channel(int(removed_channel.get("id") or 0))
-            ADMIN_PENDING_ACTIONS.pop(user_id, None)
-            ADMIN_PENDING_DATA.pop(user_id, None)
-            return await message.reply_text("✅ FSUB channel removed.")
-
-    if message.text and message.text.split(maxsplit=1)[0].split("@")[0] == "/cancel":
-        if USER_BATCH_SESSIONS.pop(user_id, None) is not None:
-            return await message.reply_text("❌ Batch process cancelled.")
-        if USER_UPLOAD_SESSIONS.pop(user_id, None) is not None:
-            return await message.reply_text("❌ Upload session cancelled.")
-
-    # Handle /batch conversational input
+    # Handle /batch session
     if user_id in USER_BATCH_SESSIONS:
         step = USER_BATCH_SESSIONS[user_id].get("step")
-        if message.text and message.text == "/cancel":
-            del USER_BATCH_SESSIONS[user_id]
-            return await message.reply_text("❌ Batch process cancelled.")
-
         if step == "await_first":
             endpoint = await _batch_endpoint(client, message)
             if not endpoint:
@@ -1208,17 +941,13 @@ async def incoming_private_messages(client: Client, message: Message):
             USER_BATCH_SESSIONS[user_id]["chat_id"] = f_chat_id
             USER_BATCH_SESSIONS[user_id]["first_id"] = f_msg_id
             USER_BATCH_SESSIONS[user_id]["step"] = "await_last"
-            return await message.reply_text(
-                f"✅ First message ID: `{f_msg_id}`\n\n"
-                "Now forward the **LAST** message from the same channel."
-            )
+            return await message.reply_text(f"✅ First message ID: `{f_msg_id}`\n\nNow forward the **LAST** message from the same channel.")
 
         elif step == "await_last":
             endpoint = await _batch_endpoint(client, message)
             if not endpoint:
                 return await message.reply_text("⚠️ Please forward the last message.")
             l_chat_id, l_msg_id = endpoint
-
             first_id = USER_BATCH_SESSIONS[user_id]["first_id"]
             chat_id = USER_BATCH_SESSIONS[user_id]["chat_id"]
             if int(l_chat_id) != int(chat_id):
@@ -1227,152 +956,53 @@ async def incoming_private_messages(client: Client, message: Message):
 
             start_id = min(first_id, l_msg_id)
             end_id = max(first_id, l_msg_id)
-            if end_id - start_id + 1 > MAX_BATCH_MESSAGES:
-                return await message.reply_text(
-                    f"⚠️ Batch ranges are limited to {MAX_BATCH_MESSAGES} message IDs. Start a new /batch session."
-                )
-
             status_msg = await message.reply_text(f"⏳ Processing `{end_id - start_id + 1}` messages into Archive...")
-
+            
             archived_ids = []
             stored_count = 0
-
             all_ids = list(range(start_id, end_id + 1))
             for i in range(0, len(all_ids), MAX_BATCH_MESSAGES):
                 chunk = all_ids[i:i + MAX_BATCH_MESSAGES]
-                try:
-                    source_reader = bot.batch_reader or client
-                    msgs = await source_reader.get_messages(chat_id, chunk)
-                except Exception as e:
-                    logger.error(f"Cannot get messages from {chat_id}: {e}")
-                    if "BOT_METHOD_INVALID" in str(e).upper() and not bot.batch_reader:
-                        return await status_msg.edit_text(
-                            "❌ Telegram rejected source-history access for the bot account. "
-                            "Set the optional `BATCH_USER_SESSION_STRING` to an authorized "
-                            "MTProto user session that can access this channel, then restart. "
-                            "No arbitrary chat-history scan is performed."
-                        )
-                    return await status_msg.edit_text(
-                        f"❌ Failed to fetch messages from source: `{e}`.\n"
-                        "Make sure the source channel is public or the bot is an administrator there."
-                    )
-
-                normalized_messages = _normalize_messages(msgs)
-                for batch_position, src_msg in enumerate(normalized_messages, start=1):
+                source_reader = bot.batch_reader or client
+                msgs = await source_reader.get_messages(chat_id, chunk)
+                for src_msg in _normalize_messages(msgs):
                     if not src_msg or src_msg.empty:
                         continue
-                    try:
-                        copied = await bot.file_storage.store_message(src_msg)
-                        if not copied:
-                            continue
+                    copied = await bot.file_storage.store_message(src_msg)
+                    if copied:
                         archived_ids.append(copied.id)
                         stored_count += 1
                         await asyncio.sleep(0.2)
-                    except FloodWait as f:
-                        await asyncio.sleep(f.value)
-                        copied = await bot.file_storage.store_message(src_msg)
-                        if not copied:
-                            continue
-                        archived_ids.append(copied.id)
-                        stored_count += 1
-                    except Exception as e:
-                        logger.error(f"Failed to archive msg {src_msg.id}: {e}")
-                    if batch_position % 10 == 0 or batch_position == len(normalized_messages):
-                        try:
-                            await status_msg.edit_text(
-                                f"⏳ Batch progress: **{stored_count}** files archived; "
-                                f"checked **{batch_position}/{len(normalized_messages)}** in this segment."
-                            )
-                        except Exception as exc:
-                            logger.debug("Could not update /batch progress: %s", exc)
 
-            if not stored_count or not archived_ids:
-                return await status_msg.edit_text("❌ No messages were successfully copied.")
-
-            try:
-                manifest_id = await save_batch_manifest(bot, bot.archive_channel_id, archived_ids)
-            except Exception as exc:
-                logger.exception("Could not save batch manifest")
-                return await status_msg.edit_text(
-                    f"❌ Files were archived, but the batch link could not be saved: `{exc}`"
-                )
+            manifest_id = await save_batch_manifest(bot, bot.archive_channel_id, archived_ids)
             batch_hash = encode_batch_manifest_id(manifest_id)
-            try:
-                bot.state_store.database.record_link("batch_" + batch_hash, "batch_manifest", manifest_id)
-            except Exception:
-                logger.exception("Could not record /batch link metadata.")
+            bot.state_store.database.record_link("batch_" + batch_hash, "batch_manifest", manifest_id)
             batch_url = f"https://t.me/{bot.username}?start=batch_{batch_hash}"
-
             await bot.state_store.update_stats(total_links=1, total_files=stored_count)
-            return await status_msg.edit_text(
-                f"🎉 **Batch Link Generated Successfully!**\n\n"
-                f"• Total Files: `{stored_count}`\n"
-                f"• Link: {batch_url}"
-            )
+            return await status_msg.edit_text(f"🎉 **Batch Link Generated!**\n• Total Files: `{stored_count}`\n• Link: {batch_url}")
 
-    # Handle /getlink upload sessions. Buffer first, then archive in source-chat
-    # message-ID order when the user generates the link. This prevents parallel
-    # Pyrogram handlers from changing the order of a multi-message forward.
+    # Handle /getlink upload sessions
     if user_id in USER_UPLOAD_SESSIONS:
         session = USER_UPLOAD_SESSIONS[user_id]
         if session.get("status") == "paused":
-            return await message.reply_text("⏸ This upload session is paused. Tap RESUME or CANCEL before sending more files.")
+            return await message.reply_text("⏸ This upload session is paused. Tap RESUME or CANCEL.")
         if session.get("status") != "recording":
             return
-
         source_messages = session.setdefault("source_messages", {})
         source_message_id = int(getattr(message, "id", 0) or 0)
-        if source_message_id <= 0:
-            return await message.reply_text("❌ I could not identify this message. Please forward it again.")
-        if source_message_id not in source_messages and len(source_messages) >= MAX_BATCH_MESSAGES:
-            return await message.reply_text(
-                f"⚠️ Upload sessions are limited to {MAX_BATCH_MESSAGES} messages. Generate this link or cancel the session."
-            )
-
         source_messages[source_message_id] = message
-        count = len(source_messages)
-        buttons = [
-            [InlineKeyboardButton("✅ GENERATE LINK", callback_data="gen_link_finish")],
-            [InlineKeyboardButton("⏸ PAUSE", callback_data="gen_link_pause"),
-             InlineKeyboardButton("❌ CANCEL", callback_data="gen_link_cancel")]
-        ]
-        control_message = session.get("control_message")
-        status_lock = session.get("status_lock")
-        if control_message and status_lock:
-            try:
-                async with status_lock:
-                    if USER_UPLOAD_SESSIONS.get(user_id) is session and session.get("status") == "recording":
-                        current_count = len(session.get("source_messages", {}))
-                        await control_message.edit_text(
-                            "📥 **Multi-Message Upload Session**\n\n"
-                            "✅ Messages queued in original send order.\n"
-                            f"Queued: **{current_count}**\n\n"
-                            "Tap **GENERATE LINK** after forwarding is complete.",
-                            reply_markup=InlineKeyboardMarkup(buttons)
-                        )
-            except MessageNotModified:
-                logger.debug("Upload queue message was already up to date.")
-            except Exception as exc:
-                logger.warning("Could not update /getlink queue status: %s", exc)
         return
 
     # Single-file direct upload
     if message.media or message.document:
         copied = await bot.file_storage.store_message(message)
         if not copied:
-            return await message.reply_text("❌ File could not be verified in the archive. Please retry.")
+            return await message.reply_text("❌ File could not be verified in the archive.")
         link_hash = encode_message_id(copied.id)
-        try:
-            bot.state_store.database.record_link(link_hash, "single", copied.id)
-        except Exception:
-            logger.exception("Could not record individual link metadata.")
+        bot.state_store.database.record_link(link_hash, "single", copied.id)
         file_url = f"https://t.me/{bot.username}?start={link_hash}"
         await bot.state_store.update_stats(total_links=1, total_files=1)
-        return await message.reply_text(
-            f"✅ **File Stored Permanently!**\n\n"
-            f"🔗 Access Link:\n{file_url}"
-        )
-
+        return await message.reply_text(f"✅ **File Stored Permanently!**\n\n🔗 Access Link:\n{file_url}")
 
 # ------------------- CALLBACK QUERY HANDLERS ------------------- #
 
@@ -1382,18 +1012,7 @@ async def callback_router(client: Client, query: CallbackQuery):
     user_id = query.from_user.id
 
     if data.startswith("adm_") and not is_admin(user_id):
-        return await query.answer("⛔ Unauthorized.", show_alert=True)
-
-    if data.startswith("try_again"):
-        param = data.split("try_again_", 1)[1] if "_" in data else None
-        unjoined = await check_fsub(client, user_id)
-        if unjoined:
-            return await query.answer("⚠️ You still haven't joined all required channels!", show_alert=True)
-        await query.answer("✅ Verification passed!")
-        await query.message.delete()
-        if param:
-            return await _deliver_start_payload(client, user_id, query.message, param)
-        return await _reply_welcome(query.message, query.from_user.first_name)
+        return query.answer("⛔ Unauthorized.", show_alert=True)
 
     if data == "gen_link_finish":
         session = USER_UPLOAD_SESSIONS.get(user_id)
@@ -1402,457 +1021,58 @@ async def callback_router(client: Client, query: CallbackQuery):
 
         finish_lock = session.setdefault("finish_lock", asyncio.Lock())
         async with finish_lock:
-            if USER_UPLOAD_SESSIONS.get(user_id) is not session:
-                return await query.answer("This upload session has already finished.", show_alert=True)
-
             session["status"] = "processing"
             source_messages = sort_upload_messages(session.get("source_messages", {}).values())
             archived_by_source_id = session.setdefault("archived", {})
-            failed_ids = []
-            progress_message = query.message
-
-            # Archive sequentially in the original private-chat message order.
-            position = 0
+            
             for source_message in source_messages:
-                position += 1
                 source_id = int(source_message.id)
                 if source_id in archived_by_source_id:
                     continue
-                try:
-                    copied = await bot.file_storage.store_message(source_message)
-                    if not copied:
-                        raise RuntimeError("Archive copy could not be verified")
+                copied = await bot.file_storage.store_message(source_message)
+                if copied:
                     archived_by_source_id[source_id] = int(copied.id)
-                except Exception:
-                    logger.exception("Could not archive /getlink source message %s", source_id)
-                    failed_ids.append(source_id)
-                if position % 10 == 0 or position == len(source_messages):
-                    try:
-                        await progress_message.edit_text(
-                            f"⏳ Saving upload: **{position}/{len(source_messages)}** messages processed.\n"
-                            f"Verified: **{len(archived_by_source_id)}** | Failed: **{len(failed_ids)}**"
-                        )
-                    except Exception as exc:
-                        logger.debug("Could not update upload progress: %s", exc)
-
-            if failed_ids:
-                session["status"] = "recording"
-                return await query.answer(
-                    f"{len(failed_ids)} message(s) could not be saved. Please tap GENERATE LINK to retry.",
-                    show_alert=True,
-                )
 
             mids = ordered_archive_message_ids(archived_by_source_id)
-            if not mids:
-                session["status"] = "recording"
-                return await query.answer("No files were successfully saved.", show_alert=True)
+            if len(mids) == 1:
+                code = encode_message_id(mids[0])
+                bot.state_store.database.record_link(code, "single", mids[0])
+                url = f"https://t.me/{bot.username}?start={code}"
+            else:
+                manifest_id = await save_batch_manifest(bot, bot.archive_channel_id, mids)
+                code = encode_batch_manifest_id(manifest_id)
+                bot.state_store.database.record_link("batch_" + code, "batch_manifest", manifest_id)
+                url = f"https://t.me/{bot.username}?start=batch_{code}"
 
-            try:
-                if len(mids) == 1:
-                    code = encode_message_id(mids[0])
-                    try:
-                        bot.state_store.database.record_link(code, "single", mids[0])
-                    except Exception:
-                        logger.exception("Could not record single-message batch link metadata.")
-                    url = f"https://t.me/{bot.username}?start={code}"
-                else:
-                    manifest_id = await save_batch_manifest(bot, bot.archive_channel_id, mids)
-                    code = encode_batch_manifest_id(manifest_id)
-                    try:
-                        bot.state_store.database.record_link("batch_" + code, "batch_manifest", manifest_id)
-                    except Exception:
-                        logger.exception("Could not record batch link metadata.")
-                    url = f"https://t.me/{bot.username}?start=batch_{code}"
-            except Exception:
-                session["status"] = "recording"
-                logger.exception("Could not create upload-session link")
-                return await query.answer(
-                    "Could not save the link manifest. Your queued messages are safe; tap GENERATE LINK to retry.",
-                    show_alert=True,
-                )
-
-            session["message_ids"] = mids
             del USER_UPLOAD_SESSIONS[user_id]
             await bot.state_store.update_stats(total_links=1, total_files=len(mids))
-            await query.answer("Ordered batch link generated successfully!")
-            await query.message.edit_text(
-                f"🎉 **Batch Generated Successfully!**\n\n"
-                f"• Count: `{len(mids)}` messages\n"
-                f"• Order: **Preserved**\n"
-                f"• Shareable Link: {url}"
-            )
-
-    elif data == "gen_link_pause":
-        session = USER_UPLOAD_SESSIONS.get(user_id)
-        if session and session.get("status") == "processing":
-            return await query.answer("The batch is being saved. Please wait for it to finish.", show_alert=True)
-        if session:
-            session["status"] = "paused"
-            await query.answer("Upload session paused.")
-            buttons = [
-                [InlineKeyboardButton("▶️ RESUME", callback_data="gen_link_resume")],
-                [InlineKeyboardButton("✅ GENERATE LINK", callback_data="gen_link_finish"),
-                 InlineKeyboardButton("❌ CANCEL", callback_data="gen_link_cancel")]
-            ]
-            await query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(buttons))
-
-    elif data == "gen_link_resume":
-        session = USER_UPLOAD_SESSIONS.get(user_id)
-        if session and session.get("status") == "processing":
-            return await query.answer("The batch is being saved. Please wait for it to finish.", show_alert=True)
-        if session:
-            session["status"] = "recording"
-            await query.answer("Upload session resumed.")
-            buttons = [
-                [InlineKeyboardButton("✅ GENERATE LINK", callback_data="gen_link_finish")],
-                [InlineKeyboardButton("⏸ PAUSE", callback_data="gen_link_pause"),
-                 InlineKeyboardButton("❌ CANCEL", callback_data="gen_link_cancel")]
-            ]
-            await query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(buttons))
-
-    elif data == "gen_link_cancel":
-        session = USER_UPLOAD_SESSIONS.get(user_id)
-        if session and session.get("status") == "processing":
-            return await query.answer("The batch is being saved. Please wait for it to finish.", show_alert=True)
-        if session:
-            del USER_UPLOAD_SESSIONS[user_id]
-        await query.answer("Upload session cancelled.")
-        await query.message.edit_text("❌ Upload session cancelled.")
+            await query.answer("Batch link generated successfully!")
+            await query.message.edit_text(f"🎉 **Batch Generated!**\n• Count: `{len(mids)}` messages\n• Shareable Link: {url}")
 
     elif data == "adm_autodetect":
-        ADMIN_PENDING_ACTIONS.pop(user_id, None)
-        ADMIN_PENDING_DATA.pop(user_id, None)
         await query.answer()
-        await query.message.edit_text(
-            _auto_detect_settings_text(),
-            reply_markup=_auto_detect_settings_keyboard(),
-        )
+        await query.message.edit_text(_auto_detect_settings_text(), reply_markup=_auto_detect_settings_keyboard())
 
     elif data == "adm_autodetect_toggle":
         settings = _get_auto_detect_settings()
         settings["enabled"] = not settings.get("enabled", True)
         await save_auto_detect_settings_to_store(bot.state_store, settings)
         await query.answer("Auto detection updated.")
-        await query.message.edit_text(
-            _auto_detect_settings_text(),
-            reply_markup=_auto_detect_settings_keyboard(),
-        )
-
-    elif data == "adm_autodetect_format":
-        settings = _get_auto_detect_settings()
-        buttons = []
-        for index, format_name in enumerate(SUPPORTED_FORMATS):
-            buttons.append([InlineKeyboardButton(
-                format_name,
-                callback_data=f"adm_autodetect_fmt_{index}",
-            )])
-        buttons.append([InlineKeyboardButton("CUSTOM REGEX", callback_data="adm_autodetect_fmt_custom")])
-        buttons.append([InlineKeyboardButton("🔙 Auto Detect Settings", callback_data="adm_autodetect")])
-        await query.answer()
-        await query.message.edit_text(
-            "🧾 **Choose filename format**\n\n"
-            "Select the pattern used to find season and episode numbers in filenames.",
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
-
-    elif data.startswith("adm_autodetect_fmt_"):
-        settings = _get_auto_detect_settings()
-        choice = data.rsplit("_", 1)[-1]
-        if choice == "custom":
-            ADMIN_PENDING_ACTIONS[user_id] = "autodetect_regex"
-            await query.answer()
-            await query.message.edit_text(
-                "🧩 Send a Python regex containing named groups `(?P<season>...)` and `(?P<episode>...)`.\n\n"
-                "Example: `S(?P<season>\\d{1,2})\\s*EP(?P<episode>\\d{1,4})`\n"
-                "Send /cancel to abort.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="adm_autodetect")]]),
-            )
-        else:
-            try:
-                index = int(choice)
-                selected_format = list(SUPPORTED_FORMATS.keys())[index]
-            except (ValueError, IndexError):
-                return await query.answer("Invalid format selection.", show_alert=True)
-            settings["format"] = selected_format
-            await save_auto_detect_settings_to_store(bot.state_store, settings)
-            await query.answer("Filename format saved.")
-            await query.message.edit_text(_auto_detect_settings_text(), reply_markup=_auto_detect_settings_keyboard())
-
-    elif data == "adm_autodetect_title":
-        ADMIN_PENDING_ACTIONS[user_id] = "autodetect_title"
-        await query.answer()
-        await query.message.edit_text(
-            "✏️ Send the anime title to use for every `/getlinkauto` batch.\n"
-            "Send `auto` to return to automatic title detection, or /cancel to abort.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="adm_autodetect")]]),
-        )
-
-    elif data == "adm_autodetect_regex":
-        ADMIN_PENDING_ACTIONS[user_id] = "autodetect_regex"
-        await query.answer()
-        await query.message.edit_text(
-            "🧩 Send a Python regex with named groups `season` and `episode`.\n"
-            "Example: `S(?P<season>\\d{1,2})\\s*EP(?P<episode>\\d{1,4})`\n"
-            "Send /cancel to abort.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="adm_autodetect")]]),
-        )
-
-    elif data == "adm_autodetect_padding":
-        settings = _get_auto_detect_settings()
-        settings["episode_padding"] = 3 if int(settings.get("episode_padding", 2)) == 2 else 2
-        await save_auto_detect_settings_to_store(bot.state_store, settings)
-        await query.answer(f"Episode padding: {settings['episode_padding']} digits")
         await query.message.edit_text(_auto_detect_settings_text(), reply_markup=_auto_detect_settings_keyboard())
-
-    elif data == "adm_autodetect_reset":
-        await save_auto_detect_settings_to_store(bot.state_store, get_default_auto_detect_settings())
-        ADMIN_PENDING_ACTIONS.pop(user_id, None)
-        ADMIN_PENDING_DATA.pop(user_id, None)
-        await query.answer("Default settings restored.")
-        await query.message.edit_text(_auto_detect_settings_text(), reply_markup=_auto_detect_settings_keyboard())
-
-    elif data == "adm_autodetect_test":
-        ADMIN_PENDING_ACTIONS[user_id] = "autodetect_test"
-        await query.answer()
-        await query.message.edit_text(
-            "🧪 Send one or more sample filenames (one filename per line).\n"
-            "I will show the detected title, seasons, episodes and qualities without creating a link.\n\n"
-            "Send /cancel to abort.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="adm_autodetect")]]),
-        )
-
-    elif data == "adm_status":
-        await query.answer()
-        stats = bot.state_store.get_stats()
-        text = (
-            f"📊 **Current Statistics**\n\n"
-            f"• Users: `{stats.get('total_users', 0)}`\n"
-            f"• Links: `{stats.get('total_links', 0)}`\n"
-            f"• Files: `{stats.get('total_files', 0)}`\n"
-            f"• Views: `{stats.get('total_views', 0)}`"
-        )
-        try:
-            await query.message.edit_text(
-                text,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]])
-            )
-        except MessageNotModified:
-            logger.debug("Admin status message was already up to date.")
-
-    elif data == "adm_edit_welcome":
-        ADMIN_PENDING_ACTIONS[user_id] = "welcome"
-        await query.answer()
-        await query.message.edit_text(
-            "📝 Send welcome text, or send a photo with its caption. Use {user} to insert the user's first name. Send /cancel to abort.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]])
-        )
-
-    elif data == "adm_broadcast":
-        await query.answer()
-        await query.message.edit_text(
-            "📬 Reply to the message you want to broadcast, then send `/broadcast` in that chat.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]])
-        )
 
     elif data == "adm_back":
-        ADMIN_PENDING_ACTIONS.pop(user_id, None)
-        ADMIN_PENDING_DATA.pop(user_id, None)
         await query.answer()
         stats = bot.state_store.get_stats()
-        text = (
-            "⚙️ **ANIFLIX Admin Dashboard**\n\n"
-            f"👥 Total Users: `{stats.get('total_users', 0)}`\n"
-            f"🔗 Generated Links: `{stats.get('total_links', 0)}`\n"
-            f"📁 Stored Files: `{stats.get('total_files', 0)}`\n"
-            f"👁️ Views/Retrievals: `{stats.get('total_views', 0)}`\n"
-        )
+        text = "⚙️ **ANIFLIX Admin Dashboard**\n\n" \
+               f"👥 Total Users: `{stats.get('total_users', 0)}`\n" \
+               f"🔗 Generated Links: `{stats.get('total_links', 0)}`\n" \
+               f"📁 Stored Files: `{stats.get('total_files', 0)}`\n" \
+               f"👁️ Views/Retrievals: `{stats.get('total_views', 0)}`\n"
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📢 FSUB Settings", callback_data="adm_fsub"),
-             InlineKeyboardButton("📊 Bot Status", callback_data="adm_status")],
-            [InlineKeyboardButton("📝 Edit Welcome", callback_data="adm_edit_welcome"),
-             InlineKeyboardButton("📬 Broadcast", callback_data="adm_broadcast")]
+            [InlineKeyboardButton("📢 FSUB Settings", callback_data="adm_fsub"), InlineKeyboardButton("📊 Bot Status", callback_data="adm_status")],
+            [InlineKeyboardButton("🧠 Auto Detect Settings", callback_data="adm_autodetect")]
         ])
         await query.message.edit_text(text, reply_markup=kb)
-
-    elif data == "adm_fsub":
-        ADMIN_PENDING_ACTIONS.pop(user_id, None)
-        ADMIN_PENDING_DATA.pop(user_id, None)
-        await query.answer()
-        channels = bot.state_store.get_fsub_channels()
-        for configured_channel in channels:
-            if configured_channel.get("join_request") or configured_channel.get("type") == "join_request":
-                await _refresh_fsub_request_stats(client, configured_channel)
-        channel_lines = []
-        for index, channel in enumerate(channels, start=1):
-            channel_id = int(channel.get("id") or 0)
-            counts = bot.state_store.get_fsub_counts(channel_id)
-            is_request = bool(channel.get("join_request") or channel.get("type") == "join_request")
-            if is_request:
-                count_text = f"Requests: {counts['requests']} | Accepted: {counts['accepted']} | Pending: {counts['pending']}"
-                method = "JOIN REQUEST"
-            else:
-                count_text = f"Verified joined: {counts['joined']}"
-                method = "NORMAL JOIN"
-            channel_lines.append(
-                f"{index}. **{channel.get('name', 'Channel')}** (`{channel.get('id') or channel.get('username')}`) — {method}\n   {count_text}"
-            )
-        ch_list = "\n\n".join(channel_lines) if channel_lines else "No force-subscription channels added yet."
-        await query.message.edit_text(
-            f"📢 **Force Subscribe Channels (Max 10)**:\n\n{ch_list}\n\n"
-            "Counts include only unique users confirmed by Telegram updates or membership checks. "
-            "Updates missed while the bot is not an admin cannot be reconstructed reliably.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("➕ Add Channel", callback_data="adm_fsub_add"),
-                 InlineKeyboardButton("➖ Remove Channel", callback_data="adm_fsub_remove")],
-                [InlineKeyboardButton("✏️ Edit Channel Name", callback_data="adm_fsub_edit")],
-                [InlineKeyboardButton("📝 Edit FSUB Message", callback_data="adm_fsub_message")],
-                [InlineKeyboardButton("🧹 Clear Channel Counts", callback_data="adm_fsub_clear")],
-                [InlineKeyboardButton("🔙 Back", callback_data="adm_back")],
-            ])
-        )
-
-    elif data == "adm_fsub_edit":
-        channels = bot.state_store.get_fsub_channels()
-        if not channels:
-            return await query.answer("No FSUB channels are configured.", show_alert=True)
-        ADMIN_PENDING_ACTIONS[user_id] = "fsub_edit_select"
-        ADMIN_PENDING_DATA.pop(user_id, None)
-        await query.answer()
-        options = [
-            f"{index}. {channel.get('name', 'Channel')} — {channel.get('id')}"
-            for index, channel in enumerate(channels, start=1)
-        ]
-        await query.message.reply_text(
-            "Send the number of the FSUB channel whose display name you want to edit:\n\n"
-            + "\n".join(options) + "\n\nSend /cancel to abort."
-        )
-
-    elif data == "adm_fsub_clear":
-        channels = bot.state_store.get_fsub_channels()
-        if not channels:
-            return await query.answer("No FSUB channels are configured.", show_alert=True)
-        ADMIN_PENDING_ACTIONS[user_id] = "fsub_clear_counts"
-        ADMIN_PENDING_DATA.pop(user_id, None)
-        await query.answer()
-        options = []
-        for index, channel in enumerate(channels, start=1):
-            method = "JOIN REQUEST" if channel.get("join_request") or channel.get("type") == "join_request" else "NORMAL JOIN"
-            options.append(f"{index}. {channel.get('name', 'Channel')} — {method}")
-        await query.message.reply_text(
-            "Send the number of the channel whose counts you want to clear:\n\n" + "\n".join(options) + "\n\nSend /cancel to abort."
-        )
-
-    elif data == "adm_fsub_clear_confirm":
-        pending = ADMIN_PENDING_DATA.pop(user_id, {})
-        channel_id = pending.get("fsub_clear_channel_id")
-        if not channel_id:
-            return await query.answer("Clear action expired. Try again.", show_alert=True)
-        await bot.state_store.clear_fsub_counts(int(channel_id))
-        await query.answer("Channel counts cleared.", show_alert=True)
-        await query.message.edit_text(
-            "✅ FSUB statistics cleared. Saved join-request access records were preserved.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 FSUB Settings", callback_data="adm_fsub")]])
-        )
-
-    elif data == "adm_fsub_clear_cancel":
-        ADMIN_PENDING_DATA.pop(user_id, None)
-        ADMIN_PENDING_ACTIONS.pop(user_id, None)
-        await query.answer("Cancelled.")
-        await query.message.edit_text(
-            "❌ Count clearing cancelled.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 FSUB Settings", callback_data="adm_fsub")]])
-        )
-
-    elif data == "adm_fsub_add":
-        if len(bot.state_store.get_fsub_channels()) >= 10:
-            return await query.answer("Maximum 10 FSUB channels are allowed.", show_alert=True)
-        ADMIN_PENDING_ACTIONS[user_id] = "fsub_add_forward"
-        ADMIN_PENDING_DATA.pop(user_id, None)
-        await query.answer()
-        await query.message.edit_text(
-            "➕ **ADD FORCE-SUB CHANNEL**\n\n"
-            "1. Add me to your channel as an administrator.\n"
-            "2. Give me **Invite Users via Link** permission.\n"
-            "3. Forward any message from that channel here.\n\n"
-            "I will verify my admin permission, then ask you to choose JOIN REQUEST or NORMAL JOIN.\n"
-            "Use /cancel to abort.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="adm_fsub")]])
-        )
-
-    elif data in {"adm_fsub_method_request", "adm_fsub_method_normal"}:
-        pending = ADMIN_PENDING_DATA.get(user_id)
-        if ADMIN_PENDING_ACTIONS.get(user_id) != "fsub_choose_method" or not pending:
-            return await query.answer("The channel setup expired. Start Add Channel again.", show_alert=True)
-        join_request = data == "adm_fsub_method_request"
-        channel_id = int(pending["id"])
-        try:
-            await _verify_bot_can_manage_invites(client, channel_id)
-            invite = await client.create_chat_invite_link(
-                chat_id=channel_id,
-                creates_join_request=join_request,
-            )
-            channels = list(bot.state_store.get_fsub_channels())
-            if len(channels) >= 10:
-                raise ValueError("The maximum of 10 FSUB channels is already configured.")
-            if any(int(item.get("id", 0) or 0) == channel_id for item in channels):
-                raise ValueError("This channel is already in the FSUB list.")
-            channels.append({
-                "id": channel_id,
-                "name": pending.get("name") or "Channel",
-                "username": pending.get("username"),
-                "link": invite.invite_link,
-                "type": "join_request" if join_request else "normal",
-                "join_request": join_request,
-            })
-            await bot.state_store.set_fsub_channels(channels)
-        except Exception as exc:
-            logger.exception("Could not complete FSUB channel setup")
-            return await query.answer(f"Could not add channel: {exc}", show_alert=True)
-
-        ADMIN_PENDING_ACTIONS.pop(user_id, None)
-        ADMIN_PENDING_DATA.pop(user_id, None)
-        await query.answer("Force-subscription channel added successfully.")
-        await query.message.edit_text(
-            f"✅ **FORCE SUBSCRIPTION ADDED**\n\n"
-            f"Channel: **{pending.get('name') or 'Channel'}**\n"
-            f"Channel ID: `{channel_id}`\n"
-            f"Method: **{'JOIN REQUEST' if join_request else 'NORMAL JOIN'}**\n"
-            f"Invite link created automatically.\n\n"
-            "For JOIN REQUEST, users can press the channel button and submit their request. "
-            "A request remains pending until a channel administrator approves it and Telegram "
-            "confirms membership. The bot never auto-approves or declines requests.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📋 View FSUB Channels", callback_data="adm_fsub")],
-                [InlineKeyboardButton("🔙 Admin Panel", callback_data="adm_back")],
-            ])
-        )
-
-    elif data == "adm_fsub_remove":
-        ADMIN_PENDING_DATA.pop(user_id, None)
-        if not bot.state_store.get_fsub_channels():
-            return await query.answer("No FSUB channels are configured.", show_alert=True)
-        ADMIN_PENDING_ACTIONS[user_id] = "fsub_remove"
-        await query.answer()
-        await query.message.edit_text(
-            "Send the 1-based number of the channel to remove, or /cancel to abort.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="adm_fsub")]])
-        )
-
-    elif data == "adm_fsub_message":
-        ADMIN_PENDING_ACTIONS[user_id] = "fsub_message"
-        await query.answer()
-        await query.message.edit_text(
-            "📝 Send the FSUB prompt as text, or send a photo with its caption. Send /cancel to abort.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="adm_fsub")]])
-        )
-
-
-def register_handlers(app: Client):
-    """Compatibility export; handlers are registered once by decorators above."""
-    if app is not bot:
-        raise ValueError("ANIFLIX handlers are bound to the configured bot client.")
-    return True
-
 
 if __name__ == "__main__":
     bot.run()
