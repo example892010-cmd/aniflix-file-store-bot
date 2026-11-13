@@ -1012,7 +1012,7 @@ async def callback_router(client: Client, query: CallbackQuery):
     user_id = query.from_user.id
 
     if data.startswith("adm_") and not is_admin(user_id):
-        return query.answer("⛔ Unauthorized.", show_alert=True)
+        return await query.answer("⛔ Unauthorized.", show_alert=True)
 
     if data == "gen_link_finish":
         session = USER_UPLOAD_SESSIONS.get(user_id)
@@ -1073,6 +1073,12 @@ async def callback_router(client: Client, query: CallbackQuery):
             [InlineKeyboardButton("🧠 Auto Detect Settings", callback_data="adm_autodetect")]
         ])
         await query.message.edit_text(text, reply_markup=kb)
+
+def register_handlers(app: Client):
+    """Compatibility export required by main.py."""
+    if app is not bot:
+        raise ValueError("ANIFLIX handlers are bound to the configured bot client.")
+    return True
 
 if __name__ == "__main__":
     bot.run()
