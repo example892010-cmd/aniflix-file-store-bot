@@ -56,8 +56,14 @@ logger = logging.getLogger("ANIFLIX-FILE-STORE-BOT")
 USER_UPLOAD_SESSIONS: Dict[int, Dict] = {}
 # In-memory tracking for /batch forwarding sessions
 USER_BATCH_SESSIONS: Dict[int, Dict] = {}
-# Channel-scoped /getlinkauto sessions; a new post resets the 3-second debounce.
+# Channel-scoped /getlinkauto sessions. Collection ends when all three
+# required quality versions are received for the same anime/season/episode.
 AUTO_CHANNEL_SESSIONS: Dict[int, Dict] = {}
+AUTO_REQUIRED_QUALITIES = frozenset({"480p", "720p", "1080p"})
+AUTO_QUALITY_RE = re.compile(
+    r"(?<!\d)(480|720|1080)\s*p(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
 ADMIN_PENDING_ACTIONS: Dict[int, str] = {}
 ADMIN_PENDING_DATA: Dict[int, Dict] = {}
 
@@ -229,8 +235,69 @@ def _auto_detect_settings_keyboard():
     ])
 
 
+def _auto_channel_message_filename(message) -> str:
+    """Return a Telegram media filename, falling back to caption or text."""
+    for field in ("document", "video", "audio", "animation"):
+        media = getattr(message, field, None)
+        filename = getattr(media, "file_name", None) if media else None
+        if filename:
+            return str(filename)
+    return str(getattr(message, "caption", None) or getattr(message, "text", None) or "")
+
+
+def _auto_message_quality_key(message, settings):
+    """Return ((normalized title, season, episode), quality) for a named file."""
+    filename = _auto_channel_message_filename(message)
+    if not filename:
+        return None
+
+    quality_match = AUTO_QUALITY_RE.search(filename)
+    if not quality_match:
+        return None
+
+    # Use the same configurable filename format as the metadata detector.
+    try:
+        from helper.auto_detect_settings import get_auto_detect_pattern
+        episode_match = get_auto_detect_pattern(settings).search(filename)
+        if not episode_match:
+            return None
+        season = int(episode_match.group("season"))
+        episode = int(episode_match.group("episode"))
+    except (ImportError, AttributeError, KeyError, TypeError, ValueError, re.error):
+        logger.exception("Could not parse /getlinkauto season/episode from %r", filename)
+        return None
+
+    title, detected_episodes = detect_auto_batch_metadata([message], settings=settings)
+    if not detected_episodes:
+        return None
+
+    quality = f"{quality_match.group(1)}p".lower()
+    return (title.casefold(), season, episode), quality
+
+
+def _record_auto_quality(session: dict, message, settings):
+    """Record a quality and return completion details once one episode has all 3."""
+    parsed = _auto_message_quality_key(message, settings)
+    if not parsed:
+        return None
+
+    episode_key, quality = parsed
+    quality_groups = session.setdefault("quality_groups", {})
+    received = quality_groups.setdefault(episode_key, set())
+    received.add(quality)
+
+    if AUTO_REQUIRED_QUALITIES.issubset(received):
+        return {
+            "title": episode_key[0],
+            "season": episode_key[1],
+            "episode": episode_key[2],
+            "qualities": sorted(received),
+        }
+    return None
+
+
 async def _finish_auto_channel_batch(client: Client, channel_id: int, session: dict):
-    """Archive the quiet-period batch, publish one link, then remove source posts."""
+    """Archive the completed quality set, publish one link, then remove source posts."""
     if AUTO_CHANNEL_SESSIONS.get(channel_id) is not session or session.get("status") != "collecting":
         return
     session["status"] = "processing"
@@ -298,14 +365,6 @@ async def _finish_auto_channel_batch(client: Client, channel_id: int, session: d
     finally:
         if AUTO_CHANNEL_SESSIONS.get(channel_id) is session:
             AUTO_CHANNEL_SESSIONS.pop(channel_id, None)
-
-
-async def _auto_channel_debounce(client: Client, channel_id: int, session: dict):
-    try:
-        await asyncio.sleep(3)
-        await _finish_auto_channel_batch(client, channel_id, session)
-    except asyncio.CancelledError:
-        return
 
 
 # ------------------- HELPER FUNCTIONS ------------------- #
@@ -668,13 +727,17 @@ async def getlinkauto_channel_handler(client: Client, message: Message):
     session = {
         "status": "collecting",
         "messages": {},
+        "quality_groups": {},
+        "completion_lock": asyncio.Lock(),
         "trigger_message_id": int(message.id),
-        "task": None,
     }
     AUTO_CHANNEL_SESSIONS[channel_id] = session
     prompt = await client.send_message(
         channel_id,
-        "📥 **Auto batch collection started.** Send the files/messages now. I will wait 3 seconds after the last post, then create one combined link.",
+        "📥 **Auto batch collection started.** Send the same episode in `[480p]`, `[720p]`, and `[1080p]` quality. "
+        "I will detect the labels from each filename and automatically create one combined batch link "
+        "when all three qualities for that anime, season, and episode arrive. No timer is used.",
+        parse_mode=None,
     )
     session["prompt_message_id"] = int(prompt.id)
 
@@ -693,11 +756,29 @@ async def getlinkauto_collect_channel_messages(client: Client, message: Message)
         int(session.get("prompt_message_id") or 0),
     }:
         return
-    session.setdefault("messages", {})[int(message.id)] = message
-    old_task = session.get("task")
-    if old_task and not old_task.done():
-        old_task.cancel()
-    session["task"] = asyncio.create_task(_auto_channel_debounce(client, channel_id, session))
+    # Serialize collection and completion so two fast Telegram updates cannot
+    # trigger the same batch twice or lose the third quality file.
+    lock = session.setdefault("completion_lock", asyncio.Lock())
+    async with lock:
+        if AUTO_CHANNEL_SESSIONS.get(channel_id) is not session:
+            return
+        if session.get("status") != "collecting":
+            return
+
+        session.setdefault("messages", {})[int(message.id)] = message
+        settings = _get_auto_detect_settings()
+        completion = _record_auto_quality(session, message, settings)
+
+        if completion:
+            logger.info(
+                "/getlinkauto channel %s: detected all required qualities for %s S%02d EP%02d (%s)",
+                channel_id,
+                completion["title"],
+                completion["season"],
+                completion["episode"],
+                ", ".join(completion["qualities"]),
+            )
+            await _finish_auto_channel_batch(client, channel_id, session)
 
 
 # ------------------- COMMAND: /GETLINK ------------------- #
