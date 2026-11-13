@@ -1,14 +1,15 @@
-
 import re
 
 
+# Matches S01 / Season 01 even when surrounded by underscores, dots, or followed directly by E01
 AUTO_SEASON_RE = re.compile(
-    r"\bS(?:EASON)?\s*0*(\d{1,2})\b",
+    r"(?:^|[\s._\-\[\(])S(?:EASON)?[\s._\-]*0*(\d{1,2})(?=[\s._\-\]\)]|E(?:P(?:ISODE)?)?\s*\d|$)",
     re.IGNORECASE,
 )
 
+# Matches E01 / EP01 / Episode 01 even when preceded by S01 or underscores
 AUTO_EPISODE_RE = re.compile(
-    r"\b(?:EPISODE|EP|E)\s*0*(\d{1,4})\b",
+    r"(?:^|[\s._\-\[\(]|S\d{1,2})E(?:PISODE|P)?[\s._\-]*0*(\d{1,4})(?=[\s._\-\]\)]|$)",
     re.IGNORECASE,
 )
 
@@ -64,7 +65,7 @@ def _message_filename(message):
 
 
 def _clean_anime_title(title):
-    """Remove channel prefixes and release tags from the anime title."""
+    """Remove channel prefixes and release tags while keeping underscores."""
 
     title = re.sub(r"^@\S+\s*-\s*", "", title.strip())
 
@@ -72,18 +73,13 @@ def _clean_anime_title(title):
     title = re.sub(r"\[[^\]]*\]", " ", title)
     title = re.sub(r"\([^)]*\)", " ", title)
 
-    # Remove the trailing Berus/Beerus release suffix
-    title = re.sub(
-        r"\s+\b(?:BERUS|BEERUS)\b\s*$",
-        "",
-        title,
-        flags=re.IGNORECASE,
-    )
+    # Normalize spaces, dots, hyphens, and underscores into single underscores
+    title = re.sub(r"[\s.\-_]+", "_", title)
 
-    title = re.sub(r"[_\.]+", " ", title)
-    title = re.sub(r"\s+", " ", title)
+    # Strip leading/trailing underscores
+    title = title.strip("_")
 
-    return title.strip().upper()
+    return title.upper()
 
 
 def detect_auto_batch_metadata(messages):
