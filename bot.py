@@ -209,43 +209,64 @@ AUTO_EPISODE_PATTERNS = (
 AUTO_QUALITY_PATTERN = re.compile(r"(?<!\d)(480|720|1080)\s*p(?![A-Za-z0-9])", re.I)
 
 
-def _auto_message_filename(message) -> str:
-    for field in ("document", "video", "audio", "animation"):
+def _auto_message_candidates(message) -> List[str]:
+    """Return every possible filename/caption source; Telegram may expose the
+    real uploaded name in the caption while the media file_name is generic."""
+    values = []
+    for field in ("document", "video", "audio", "animation", "photo"):
         media = getattr(message, field, None)
         filename = getattr(media, "file_name", None) if media else None
         if filename:
-            return str(filename)
-    return str(getattr(message, "caption", None) or getattr(message, "text", None) or "")
+            values.append(str(filename))
+    for field in ("caption", "text"):
+        value = getattr(message, field, None)
+        if value:
+            values.append(str(value))
+    # Preserve order while removing duplicate strings.
+    return list(dict.fromkeys(value.strip() for value in values if value and value.strip()))
+
+
+def _auto_message_filename(message) -> str:
+    """Compatibility helper: return the first available filename/caption."""
+    candidates = _auto_message_candidates(message)
+    return candidates[0] if candidates else ""
 
 
 def _clean_detected_anime_title(value: str) -> str:
     title = re.sub(r"\.[A-Za-z0-9]{2,5}$", "", str(value or "")).strip()
-    title = re.sub(r"^\s*@\S+\s*(?:[-–—:]\s*)?", "", title)
+    # Remove uploader/channel tags without consuming the actual anime title.
+    title = re.sub(r"^\s*@[^\s]+\s*(?:[-–—:]\s*)?", "", title)
     title = re.sub(r"\[[^]]*\]|\([^)]*\)|\{[^}]*\}", " ", title)
     title = re.sub(r"[_|]+", " ", title)
     title = re.sub(r"\s*[-–—:]+\s*$", "", title)
-    return re.sub(r"\s+", " ", title).strip(" ._-–—:").upper()
+    title = re.sub(r"\s+", " ", title).strip(" ._-–—:")
+    # Remove common residual uploader labels if the prefix is separated by a dash.
+    return title.upper()
 
 
 def detect_collected_metadata(messages: Iterable[Message]) -> dict:
-    """Detect title, season/episode numbers, and qualities from collected filenames."""
+    """Detect title, season/episode numbers, and qualities from all message text."""
     title = ""
     episodes = {}
     qualities = set()
     detected_files = 0
     for message in messages:
-        filename = _auto_message_filename(message)
-        if not filename:
-            continue
-        quality = AUTO_QUALITY_PATTERN.search(filename)
-        if quality:
-            qualities.add(f"{quality.group(1)}p")
+        candidates = _auto_message_candidates(message)
+        matched_filename = None
         episode_match = None
-        for pattern in AUTO_EPISODE_PATTERNS:
-            episode_match = pattern.search(filename)
+        for candidate in candidates:
+            quality = AUTO_QUALITY_PATTERN.search(candidate)
+            if quality:
+                qualities.add(f"{quality.group(1)}p")
+            for pattern in AUTO_EPISODE_PATTERNS:
+                found = pattern.search(candidate)
+                if found:
+                    matched_filename = candidate
+                    episode_match = found
+                    break
             if episode_match:
                 break
-        if not episode_match:
+        if not episode_match or matched_filename is None:
             continue
         try:
             season = int(episode_match.group("season"))
@@ -255,7 +276,7 @@ def detect_collected_metadata(messages: Iterable[Message]) -> dict:
         episodes.setdefault(season, set()).add(episode)
         detected_files += 1
         if not title:
-            title = _clean_detected_anime_title(filename[:episode_match.start()])
+            title = _clean_detected_anime_title(matched_filename[:episode_match.start()])
     return {
         "title": title or "ANIME FILES",
         "episodes": episodes,
