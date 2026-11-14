@@ -474,39 +474,71 @@ async def _verify_bot_can_manage_invites(client: Client, channel_id: int):
 
 
 async def check_fsub(client: Client, user_id: int) -> List[Dict]:
-    """Return channels still required for FSUB verification.
+    """Return channels the user still needs to satisfy for FSUB.
 
-    Normal-join and join-request channels both require confirmed Telegram
-    membership. A recorded join request is pending evidence only and never
-    grants access before an administrator accepts it.
+    Normal channels require confirmed membership. For a channel configured
+    for join requests, a join request recorded by the chat_join_request
+    handler is sufficient while it is pending; Telegram reports such users
+    as NOT_MEMBER, so get_chat_member() must not reject them.
     """
-    # The persisted admin-managed list is authoritative. In particular, an
-    # empty list means FSUB is disabled; never resurrect removed channels from
-    # legacy config defaults.
+    # The persisted admin-managed list is authoritative. An empty list means
+    # FSUB is disabled.
     fsub_channels = bot.state_store.get_fsub_channels()
-
     unjoined = []
+
     for ch in fsub_channels:
         chat_identifier = ch.get("id") or ch.get("username")
-        is_request_channel = bool(ch.get("join_request") or ch.get("type") == "join_request")
-        has_request = is_request_channel and bot.state_store.has_fsub_join_request(
-            int(ch.get("id") or 0), user_id
+        channel_id = int(ch.get("id") or 0)
+        is_request_channel = bool(
+            ch.get("join_request") or ch.get("type") == "join_request"
         )
+
+        # A pending request is stored by record_fsub_join_request().
+        # It counts as verified immediately; do not test membership first.
+        if is_request_channel and channel_id:
+            try:
+                if bot.state_store.has_fsub_join_request(channel_id, user_id):
+                    logger.info(
+                        "FSUB join request verified: channel=%s user=%s",
+                        channel_id,
+                        user_id,
+                    )
+                    continue
+            except Exception:
+                logger.exception(
+                    "Could not check saved FSUB join request: channel=%s user=%s",
+                    channel_id,
+                    user_id,
+                )
+
         try:
             member = await client.get_chat_member(chat_identifier, user_id)
             if not _is_joined_member(member):
                 unjoined.append(ch)
-            elif is_request_channel and has_request:
-                await bot.state_store.record_fsub_member(
-                    int(ch.get("id") or 0), user_id, accepted=True
-                )
-            elif not is_request_channel:
-                await bot.state_store.record_fsub_member(int(ch.get("id") or 0), user_id)
+            elif is_request_channel and channel_id:
+                # If the request was approved, count it as accepted.
+                try:
+                    if bot.state_store.has_fsub_join_request(channel_id, user_id):
+                        await bot.state_store.record_fsub_member(
+                            channel_id, user_id, accepted=True
+                        )
+                except Exception:
+                    logger.exception(
+                        "Could not update accepted FSUB request statistics."
+                    )
+            elif channel_id:
+                await bot.state_store.record_fsub_member(channel_id, user_id)
+
         except UserNotParticipant:
             unjoined.append(ch)
-        except Exception as e:
-            logger.warning("FSUB membership check failed for %s: %s", chat_identifier, e)
+        except Exception as exc:
+            logger.warning(
+                "FSUB membership check failed for %s: %s",
+                chat_identifier,
+                exc,
+            )
             unjoined.append(ch)
+
     return unjoined
 
 
