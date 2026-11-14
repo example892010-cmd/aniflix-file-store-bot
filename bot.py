@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Iterable
 from urllib.parse import urlparse
 from pyrogram import Client, filters
 from pyrogram.types import (
@@ -197,6 +197,89 @@ async def _save_auto_collection_count(value: int) -> int:
     return value
 
 
+# Filename metadata detection used by /getlinkauto. This is independent from
+# collection count: every selected message is archived into ONE link, while the
+# filenames are scanned to build the episode/title summary.
+AUTO_EPISODE_PATTERNS = (
+    re.compile(r"(?<![A-Za-z0-9])S\s*(?P<season>\d{1,2})\s*EP?\s*(?P<episode>\d{1,4})(?!\d)", re.I),
+    re.compile(r"(?<![A-Za-z0-9])S\s*(?P<season>\d{1,2})\s*E\s*(?P<episode>\d{1,4})(?!\d)", re.I),
+    re.compile(r"\bSeason\s*(?P<season>\d{1,2})\s*Episode\s*(?P<episode>\d{1,4})(?!\d)", re.I),
+    re.compile(r"(?<!\d)(?P<season>\d{1,2})\s*[xX]\s*(?P<episode>\d{1,4})(?!\d)"),
+)
+AUTO_QUALITY_PATTERN = re.compile(r"(?<!\d)(480|720|1080)\s*p(?![A-Za-z0-9])", re.I)
+
+
+def _auto_message_filename(message) -> str:
+    for field in ("document", "video", "audio", "animation"):
+        media = getattr(message, field, None)
+        filename = getattr(media, "file_name", None) if media else None
+        if filename:
+            return str(filename)
+    return str(getattr(message, "caption", None) or getattr(message, "text", None) or "")
+
+
+def _clean_detected_anime_title(value: str) -> str:
+    title = re.sub(r"\.[A-Za-z0-9]{2,5}$", "", str(value or "")).strip()
+    title = re.sub(r"^\s*@\S+\s*(?:[-–—:]\s*)?", "", title)
+    title = re.sub(r"\[[^]]*\]|\([^)]*\)|\{[^}]*\}", " ", title)
+    title = re.sub(r"[_|]+", " ", title)
+    title = re.sub(r"\s*[-–—:]+\s*$", "", title)
+    return re.sub(r"\s+", " ", title).strip(" ._-–—:").upper()
+
+
+def detect_collected_metadata(messages: Iterable[Message]) -> dict:
+    """Detect title, season/episode numbers, and qualities from collected filenames."""
+    title = ""
+    episodes = {}
+    qualities = set()
+    detected_files = 0
+    for message in messages:
+        filename = _auto_message_filename(message)
+        if not filename:
+            continue
+        quality = AUTO_QUALITY_PATTERN.search(filename)
+        if quality:
+            qualities.add(f"{quality.group(1)}p")
+        episode_match = None
+        for pattern in AUTO_EPISODE_PATTERNS:
+            episode_match = pattern.search(filename)
+            if episode_match:
+                break
+        if not episode_match:
+            continue
+        try:
+            season = int(episode_match.group("season"))
+            episode = int(episode_match.group("episode"))
+        except (TypeError, ValueError):
+            continue
+        episodes.setdefault(season, set()).add(episode)
+        detected_files += 1
+        if not title:
+            title = _clean_detected_anime_title(filename[:episode_match.start()])
+    return {
+        "title": title or "ANIME FILES",
+        "episodes": episodes,
+        "episode_count": sum(len(items) for items in episodes.values()),
+        "qualities": [q for q in ("480p", "720p", "1080p") if q in qualities],
+        "detected_files": detected_files,
+    }
+
+
+def build_collected_metadata_text(metadata: dict, url: str, message_count: int) -> str:
+    """Format the result exactly like /batch1renamed, with no blank lines."""
+    lines = ["/batch1renamed", (metadata.get("title") or "ANIME FILES").upper()]
+    episodes = metadata.get("episodes") or {}
+    for season in sorted(episodes):
+        season_number = int(season)
+        season_label = f"{season_number:02d}" if season_number < 10 else str(season_number)
+        lines.append(f"Season {season_label}")
+        lines.extend(f"{int(ep):02d}" for ep in sorted(episodes[season]))
+    if not episodes:
+        lines.append("Season 01")
+    lines.append(url)
+    return "\n".join(lines)
+
+
 def _auto_collection_settings_text() -> str:
     count = _get_auto_collection_count()
     return (
@@ -263,11 +346,9 @@ async def _finish_auto_collection(
             logger.exception("Could not record /getlinkauto link metadata.")
 
         url = f"https://t.me/{bot.username}?start=batch_{code}"
-        result_text = (
-            "✅ Collection completed!\n\n"
-            f"Messages collected: {len(archived_ids)}\n"
-            "One combined link for all collected messages:\n"
-            f"{url}"
+        metadata = detect_collected_metadata(ordered_messages)
+        result_text = build_collected_metadata_text(
+            metadata, url, len(archived_ids)
         )
         status_message = await client.send_message(
             channel_id, result_text, parse_mode=None
