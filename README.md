@@ -124,3 +124,12 @@ Shortener settings, including the API key, are saved in the dedicated SQLite `ap
 
 To configure: open `/admin` → **URL Shortener** → **Set Domain + API Key**, send `your-domain.example YOUR_API_KEY`, then set the tutorial URL if needed, test the API, and enable the shortener. Use the bypass-user controls to exempt premium/manual user IDs.
 
+
+## Delivered-file auto-delete
+
+Administrators can open `/admin` → **Auto Delete** to enable automatic deletion
+of delivered file copies and set a timer from 30 minutes through 24 hours. The
+timer starts separately when each file is delivered. Deletion jobs are persisted
+in SQLite and resume after a bot restart. Only the copies sent to users are
+scheduled; archive-channel messages, batch manifests, and stored links are not
+modified or deleted. The feature is disabled by default.

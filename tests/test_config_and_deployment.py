@@ -54,15 +54,22 @@ class ConfigAndDeploymentTests(unittest.TestCase):
         self.assertIn("healthCheckPath: /health", render)
         self.assertIn("startCommand: python main.py", render)
 
-    def test_runtime_has_no_mongodb_and_auto_delete_is_scoped_to_channel_batch(self):
-        for relative in ("bot.py", "main.py", "config.py", "helper/storage.py"):
+    def test_runtime_has_no_mongodb_and_delivery_auto_delete_is_separate_from_archive_cleanup(self):
+        for relative in ("bot.py", "main.py", "config.py", "helper/storage.py", "helper/sqlite_store.py"):
             text = (ROOT / relative).read_text().lower()
-            for term in ("mongodb", "pymongo", "motor", "auto_del"):
+            for term in ("mongodb", "pymongo", "motor"):
                 self.assertNotIn(term, text, f"{term} found in {relative}")
         bot_source = (ROOT / "bot.py").read_text()
-        self.assertIn("async def _finish_auto_channel_batch", bot_source)
-        self.assertIn("await client.delete_messages(channel_id, chunk)", bot_source)
-        self.assertIn("# Delete only after every source message", bot_source)
+        storage_source = (ROOT / "helper/storage.py").read_text()
+        sqlite_source = (ROOT / "helper/sqlite_store.py").read_text()
+        self.assertIn("async def _finish_auto_collection", bot_source)
+        self.assertIn("await client.delete_messages(channel_id, source_ids[offset:offset + 100])", bot_source)
+        self.assertIn("# Delete only the messages in this completed batch", bot_source)
+        self.assertIn('callback_data="adm_autodel"', bot_source)
+        self.assertIn('"delivery_auto_delete"', bot_source)
+        self.assertIn("on_delivered=_schedule_delivered_message_deletion", bot_source)
+        self.assertIn("scheduled_message_deletions", sqlite_source)
+        self.assertIn("on_delivered", storage_source)
 
     def test_no_production_get_chat_history_calls(self):
         production_files = [ROOT / "main.py", ROOT / "bot.py", ROOT / "config.py"]

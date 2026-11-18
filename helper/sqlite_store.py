@@ -150,6 +150,15 @@ class SQLiteStore:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(namespace, key)
                 );
+                CREATE TABLE IF NOT EXISTS scheduled_message_deletions (
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    delete_at REAL NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(chat_id, message_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_scheduled_message_deletions_due
+                    ON scheduled_message_deletions(delete_at);
                 """
             )
             self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -274,6 +283,33 @@ class SQLiteStore:
                    ON CONFLICT(namespace, key) DO UPDATE SET
                        value=excluded.value, updated_at=excluded.updated_at""",
                 (str(namespace), str(key), encoded, now),
+            )
+
+    def schedule_message_deletion(self, chat_id: int, message_id: int, delete_at: float) -> None:
+        """Persist a delivered-message deletion deadline; archive messages are never queued."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT INTO scheduled_message_deletions(chat_id, message_id, delete_at, created_at) "
+                "VALUES(?, ?, ?, ?) ON CONFLICT(chat_id, message_id) "
+                "DO UPDATE SET delete_at=excluded.delete_at",
+                (int(chat_id), int(message_id), float(delete_at), now),
+            )
+
+    def get_due_message_deletions(self, now: float, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT chat_id, message_id, delete_at FROM scheduled_message_deletions "
+                "WHERE delete_at<=? ORDER BY delete_at LIMIT ?",
+                (float(now), max(1, min(1000, int(limit)))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def remove_scheduled_message_deletion(self, chat_id: int, message_id: int) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "DELETE FROM scheduled_message_deletions WHERE chat_id=? AND message_id=?",
+                (int(chat_id), int(message_id)),
             )
 
     def close(self) -> None:

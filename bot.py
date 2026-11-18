@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+import time
 from typing import Dict, List, Optional, Iterable
 from urllib.parse import urlparse
 from pyrogram import Client, filters
@@ -57,6 +58,7 @@ AUTO_COLLECTION_MAX = 10
 AUTO_COLLECTION_DEFAULT = 3
 ADMIN_PENDING_ACTIONS: Dict[int, str] = {}
 ADMIN_PENDING_DATA: Dict[int, Dict] = {}
+AUTO_DELETE_WORKER_TASK = None
 
 
 def _get_archive_channel_id() -> int:
@@ -105,6 +107,9 @@ class AniflixBot(Client):
             # Initialize remote state safely without get_chat_history
             await self.state_store.load_state()
             logger.info("Bot state initialized successfully.")
+            global AUTO_DELETE_WORKER_TASK
+            if AUTO_DELETE_WORKER_TASK is None or AUTO_DELETE_WORKER_TASK.done():
+                AUTO_DELETE_WORKER_TASK = asyncio.create_task(_auto_delete_worker())
         except Exception:
             if self.batch_reader and self.batch_reader.is_connected:
                 await self.batch_reader.stop()
@@ -112,6 +117,14 @@ class AniflixBot(Client):
             raise
 
     async def stop(self, *args):
+        global AUTO_DELETE_WORKER_TASK
+        if AUTO_DELETE_WORKER_TASK and not AUTO_DELETE_WORKER_TASK.done():
+            AUTO_DELETE_WORKER_TASK.cancel()
+            try:
+                await AUTO_DELETE_WORKER_TASK
+            except asyncio.CancelledError:
+                pass
+            AUTO_DELETE_WORKER_TASK = None
         await self.state_store.save_state()
         if self.batch_reader and self.batch_reader.is_connected:
             await self.batch_reader.stop()
@@ -725,6 +738,86 @@ def get_fsub_keyboard(unjoined: List[Dict], redirect_data: Optional[str] = None)
     return InlineKeyboardMarkup(buttons)
 
 
+# ------------------- SQLITE DELIVERY AUTO DELETE ------------------- #
+
+AUTO_DELETE_NAMESPACE = "delivery_auto_delete"
+AUTO_DELETE_DEFAULTS = {"enabled": False, "minutes": 30}
+
+
+def _auto_delete_settings() -> Dict:
+    saved = bot.state_store.database.get_app_settings(AUTO_DELETE_NAMESPACE)
+    settings = dict(AUTO_DELETE_DEFAULTS)
+    settings.update({key: value for key, value in saved.items() if key in settings})
+    try:
+        settings["minutes"] = max(30, min(1440, int(settings.get("minutes", 30))))
+    except (TypeError, ValueError):
+        settings["minutes"] = 30
+    settings["enabled"] = bool(settings.get("enabled"))
+    return settings
+
+
+async def _set_auto_delete_setting(key: str, value) -> None:
+    if key not in AUTO_DELETE_DEFAULTS:
+        raise KeyError(f"Unknown auto-delete setting: {key}")
+    bot.state_store.database.set_app_setting(AUTO_DELETE_NAMESPACE, key, value)
+
+
+def _schedule_delivered_message_deletion(delivered_message: Message) -> None:
+    """Queue only the user's delivered copy, never its archive-channel source."""
+    settings = _auto_delete_settings()
+    if not settings["enabled"]:
+        return
+    chat_id = int(getattr(getattr(delivered_message, "chat", None), "id", 0) or 0)
+    message_id = int(getattr(delivered_message, "id", 0) or 0)
+    if chat_id <= 0 or message_id <= 0:
+        return
+    delete_at = time.time() + settings["minutes"] * 60
+    bot.state_store.database.schedule_message_deletion(chat_id, message_id, delete_at)
+
+
+async def _auto_delete_worker() -> None:
+    """Resume persisted deletion jobs after restarts and delete due delivered copies."""
+    database = bot.state_store.database
+    while True:
+        due = database.get_due_message_deletions(time.time(), limit=100)
+        for item in due:
+            chat_id = int(item["chat_id"])
+            message_id = int(item["message_id"])
+            try:
+                await bot.delete_messages(chat_id, message_id)
+            except Exception as exc:
+                # A missing/already-deleted or undeletable user copy must not block the queue.
+                logger.info("Auto-delete could not delete delivered message %s in %s: %s", message_id, chat_id, exc)
+            finally:
+                database.remove_scheduled_message_deletion(chat_id, message_id)
+        await asyncio.sleep(10)
+
+
+def _auto_delete_panel_text() -> str:
+    settings = _auto_delete_settings()
+    status = "✅ ENABLED" if settings["enabled"] else "❌ DISABLED"
+    minutes = settings["minutes"]
+    duration = f"{minutes // 60} hour(s)" if minutes % 60 == 0 and minutes >= 60 else f"{minutes} minutes"
+    return (
+        "🗑️ **DELIVERED FILE AUTO-DELETE**\n\n"
+        f"• Status: **{status}**\n"
+        f"• Delete after: **{duration}**\n\n"
+        "The timer starts after each file is delivered to the user. Only the delivered copy is deleted. "
+        "Original archive-channel messages, stored links and batch manifests are never deleted.\n\n"
+        "Allowed timer: 30 minutes to 24 hours."
+    )
+
+
+def _auto_delete_panel_keyboard() -> InlineKeyboardMarkup:
+    settings = _auto_delete_settings()
+    toggle = "⛔ Disable Auto Delete" if settings["enabled"] else "✅ Enable Auto Delete"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle, callback_data="adm_autodel_toggle")],
+        [InlineKeyboardButton("⏱️ Set Timer (30 min – 24 hours)", callback_data="adm_autodel_timer")],
+        [InlineKeyboardButton("🔙 Admin Panel", callback_data="adm_back")],
+    ])
+
+
 # ------------------- COMMAND: /START ------------------- #
 
 async def _deliver_start_payload(client: Client, user_id: int, message: Message, param: str):
@@ -740,6 +833,7 @@ async def _deliver_start_payload(client: Client, user_id: int, message: Message,
                     manifest_id,
                     user_id,
                     bot.settings.protect_content,
+                    on_delivered=_schedule_delivered_message_deletion,
                 )
                 await bot.state_store.update_stats(total_views=1)
                 if sent_count == 0:
@@ -758,7 +852,8 @@ async def _deliver_start_payload(client: Client, user_id: int, message: Message,
             sent_count = failed_count = 0
             for message_id in range(start_id, end_id + 1):
                 if await bot.file_storage.deliver_message(
-                    user_id, message_id, bot.settings.protect_content
+                    user_id, message_id, bot.settings.protect_content,
+                    on_delivered=_schedule_delivered_message_deletion,
                 ):
                     sent_count += 1
                 else:
@@ -775,7 +870,8 @@ async def _deliver_start_payload(client: Client, user_id: int, message: Message,
 
         message_id = decode_message_id(param)
         if not await bot.file_storage.deliver_message(
-            user_id, message_id, bot.settings.protect_content
+            user_id, message_id, bot.settings.protect_content,
+            on_delivered=_schedule_delivered_message_deletion,
         ):
             return await message.reply_text("❌ This file is no longer available in the archive.")
         await bot.state_store.update_stats(total_views=1)
@@ -1093,7 +1189,8 @@ async def admin_panel(client: Client, message: Message):
         [InlineKeyboardButton("📝 Edit Welcome", callback_data="adm_edit_welcome"),
          InlineKeyboardButton("📬 Broadcast", callback_data="adm_broadcast")],
         [InlineKeyboardButton("📥 Epi Collecting", callback_data="adm_epicollect")],
-        [InlineKeyboardButton("🔗 URL Shortener", callback_data="adm_shortener")]
+        [InlineKeyboardButton("🔗 URL Shortener", callback_data="adm_shortener")],
+        [InlineKeyboardButton("🗑️ Auto Delete", callback_data="adm_autodel")]
     ])
     await message.reply_text(text, reply_markup=kb)
 
@@ -1344,6 +1441,23 @@ async def incoming_private_messages(client: Client, message: Message):
             ADMIN_PENDING_ACTIONS.pop(user_id, None)
             ADMIN_PENDING_DATA.pop(user_id, None)
             return await message.reply_text("✅ FSUB channel display name updated.")
+
+        if action == "delivery_auto_delete_timer":
+            raw = (message.text or "").strip().lower()
+            match = re.fullmatch(r"(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours)?", raw)
+            if not match:
+                return await message.reply_text("Send a timer such as `30m`, `90m`, `2h`, or `24h`, or /cancel.")
+            amount = int(match.group(1))
+            unit = match.group(2) or "m"
+            minutes = amount * 60 if unit in {"h", "hr", "hrs", "hour", "hours"} else amount
+            if not 30 <= minutes <= 1440:
+                return await message.reply_text("Timer must be between 30 minutes and 24 hours. Try again or /cancel.")
+            await _set_auto_delete_setting("minutes", minutes)
+            ADMIN_PENDING_ACTIONS.pop(user_id, None)
+            return await message.reply_text(
+                f"✅ Delivery auto-delete timer set to **{minutes} minutes**.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑️ Auto Delete Settings", callback_data="adm_autodel")]])
+            )
 
         if action == "url_shortener_credentials":
             raw = (message.text or "").strip()
@@ -1825,6 +1939,32 @@ async def callback_router(client: Client, query: CallbackQuery):
             reply_markup=_auto_collection_settings_keyboard(),
         )
 
+    elif data == "adm_autodel":
+        ADMIN_PENDING_ACTIONS.pop(user_id, None)
+        ADMIN_PENDING_DATA.pop(user_id, None)
+        await query.answer()
+        await query.message.edit_text(_auto_delete_panel_text(), reply_markup=_auto_delete_panel_keyboard())
+
+    elif data == "adm_autodel_toggle":
+        settings = _auto_delete_settings()
+        new_status = not settings["enabled"]
+        await _set_auto_delete_setting("enabled", new_status)
+        await query.answer("Delivery auto-delete enabled." if new_status else "Delivery auto-delete disabled.")
+        await query.message.edit_text(_auto_delete_panel_text(), reply_markup=_auto_delete_panel_keyboard())
+
+    elif data == "adm_autodel_timer":
+        ADMIN_PENDING_ACTIONS[user_id] = "delivery_auto_delete_timer"
+        ADMIN_PENDING_DATA.pop(user_id, None)
+        current = _auto_delete_settings()["minutes"]
+        await query.answer()
+        await query.message.edit_text(
+            "⏱️ **SET DELIVERY AUTO-DELETE TIMER**\n\n"
+            f"Current timer: `{current} minutes`\n\n"
+            "Send a duration such as `30m`, `90m`, `2h`, or `24h`.\n"
+            "Minimum 30 minutes; maximum 24 hours.\n"
+            "The timer starts after each file is delivered. Send /cancel to abort."
+        )
+
     elif data == "adm_shortener":
         ADMIN_PENDING_ACTIONS.pop(user_id, None)
         ADMIN_PENDING_DATA.pop(user_id, None)
@@ -1970,7 +2110,8 @@ async def callback_router(client: Client, query: CallbackQuery):
             [InlineKeyboardButton("📝 Edit Welcome", callback_data="adm_edit_welcome"),
              InlineKeyboardButton("📬 Broadcast", callback_data="adm_broadcast")],
             [InlineKeyboardButton("📥 Epi Collecting", callback_data="adm_epicollect")],
-            [InlineKeyboardButton("🔗 URL Shortener", callback_data="adm_shortener")]
+            [InlineKeyboardButton("🔗 URL Shortener", callback_data="adm_shortener")],
+        [InlineKeyboardButton("🗑️ Auto Delete", callback_data="adm_autodel")]
         ])
         await query.message.edit_text(text, reply_markup=kb)
 

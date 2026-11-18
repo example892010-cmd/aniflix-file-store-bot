@@ -75,6 +75,7 @@ async def deliver_archived_message(
     message_id: int,
     destination_chat_id: int,
     protect_content: bool = False,
+    on_delivered=None,
 ):
     """Read an explicit archive message ID and copy it to a destination chat."""
     archived = await _get_by_id(client, archive_channel_id, message_id)
@@ -85,7 +86,13 @@ async def deliver_archived_message(
         kwargs["protect_content"] = True
     for attempt in range(MAX_TELEGRAM_RETRIES):
         try:
-            return await archived.copy(**kwargs)
+            delivered_message = await archived.copy(**kwargs)
+            if on_delivered and delivered_message:
+                try:
+                    on_delivered(delivered_message)
+                except Exception:
+                    logger.exception("Could not schedule auto-delete for delivered message %s", message_id)
+            return delivered_message
         except FloodWait as wait:
             delay = max(1, int(getattr(wait, "value", 1) or 1))
             logger.warning("Telegram FloodWait while delivering archive message %s; sleeping %s seconds.",
@@ -212,6 +219,7 @@ async def deliver_archived_batch(
     manifest_message_id: int,
     destination_chat_id: int,
     protect_content: bool = False,
+    on_delivered=None,
 ):
     """Deliver ordered IDs from legacy, current, or tree-based auto manifests."""
     root = await _get_by_id(client, archive_channel_id, manifest_message_id)
@@ -226,7 +234,8 @@ async def deliver_archived_batch(
     for message_id in ids:
         try:
             await deliver_archived_message(
-                client, archive_channel_id, message_id, destination_chat_id, protect_content
+                client, archive_channel_id, message_id, destination_chat_id,
+                protect_content, on_delivered=on_delivered
             )
             delivered += 1
         except Exception as exc:
@@ -332,10 +341,11 @@ class Storage:
         return all_messages
 
     async def deliver_message(self, to_chat_id: int, message_id: int,
-                              protect_content: bool = False) -> bool:
+                              protect_content: bool = False, on_delivered=None) -> bool:
         try:
             await deliver_archived_message(
-                self.client, self.archive_channel_id, message_id, to_chat_id, protect_content
+                self.client, self.archive_channel_id, message_id, to_chat_id,
+                protect_content, on_delivered=on_delivered
             )
             return True
         except Exception as exc:
