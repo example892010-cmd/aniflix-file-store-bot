@@ -88,7 +88,8 @@ class ForceSubIntegrationSourceTests(unittest.TestCase):
         callback = self.source.index('if data.startswith("try_again"):')
         section = self.source[callback:callback + 1600]
         self.assertIn('data.split("try_again_", 1)[1]', section)
-        self.assertIn("_deliver_start_payload(client, user_id, query.message, param)", section)
+        self.assertIn("_process_start_payload(client, user_id, query.message, param)", section)
+        self.assertIn("_deliver_start_payload(client, user_id, message, original_param)", self.source)
 
     def test_old_and_new_admin_input_formats_are_retained(self):
         self.assertIn("Forward any message from that channel here.", self.source)

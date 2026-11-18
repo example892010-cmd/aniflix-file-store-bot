@@ -32,6 +32,13 @@ from helper.storage import (
     save_batch_manifest,
 )
 from helper.upload_order import ordered_archive_message_ids, sort_upload_messages
+from helper.url_shortener import (
+    is_http_url,
+    make_shortener_start_param,
+    normalize_shortener_domain,
+    shorten_url,
+    unwrap_shortener_start_param,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -420,6 +427,116 @@ async def _finish_auto_collection(
             logger.exception("Could not send /getlinkauto error message.")
 
 
+# ------------------- SQLITE URL SHORTENER ------------------- #
+
+URL_SHORTENER_NAMESPACE = "url_shortener"
+URL_SHORTENER_DEFAULTS = {
+    "enabled": False,
+    "domain": "",
+    "api_key": "",
+    "tutorial_link": "",
+    "bypass_users": [],
+}
+
+
+def _url_shortener_settings() -> Dict:
+    """Read shortener settings from the dedicated SQLite settings table."""
+    saved = bot.state_store.database.get_app_settings(URL_SHORTENER_NAMESPACE)
+    result = dict(URL_SHORTENER_DEFAULTS)
+    result.update({key: value for key, value in saved.items() if key in result})
+    if not isinstance(result.get("bypass_users"), list):
+        result["bypass_users"] = []
+    result["bypass_users"] = sorted({
+        int(value) for value in result["bypass_users"]
+        if str(value).lstrip("-").isdigit() and int(value) > 0
+    })
+    result["enabled"] = bool(result.get("enabled"))
+    return result
+
+
+async def _set_url_shortener_setting(key: str, value) -> None:
+    if key not in URL_SHORTENER_DEFAULTS:
+        raise KeyError(f"Unknown URL shortener setting: {key}")
+    bot.state_store.database.set_app_setting(URL_SHORTENER_NAMESPACE, key, value)
+
+
+def _url_shortener_panel_text() -> str:
+    settings = _url_shortener_settings()
+    api_key = str(settings.get("api_key") or "")
+    masked_api = ("•" * max(4, min(12, len(api_key) - 4)) + api_key[-4:]) if api_key else "Not configured"
+    status = "✅ ENABLED" if settings["enabled"] else "❌ DISABLED"
+    credentials = "✅ Configured" if settings.get("domain") and api_key else "⚠️ Missing domain/API key"
+    tutorial = settings.get("tutorial_link") or "Not configured"
+    bypass_count = len(settings.get("bypass_users", []))
+    return (
+        "🔗 **URL SHORTENER SETTINGS**\n\n"
+        f"• Status: **{status}**\n"
+        f"• Provider: `{settings.get('domain') or 'Not configured'}`\n"
+        f"• API key: `{masked_api}`\n"
+        f"• Credentials: {credentials}\n"
+        f"• Tutorial: `{tutorial}`\n"
+        f"• Premium/bypass users: `{bypass_count}`\n\n"
+        "When enabled, regular users receive a shortened continuation link before file delivery. "
+        "Owner and configured premium/bypass users receive direct files."
+    )
+
+
+def _url_shortener_panel_keyboard() -> InlineKeyboardMarkup:
+    settings = _url_shortener_settings()
+    toggle_label = "⛔ Disable Shortener" if settings["enabled"] else "✅ Enable Shortener"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle_label, callback_data="adm_shortener_toggle")],
+        [InlineKeyboardButton("⚙️ Set Domain + API Key", callback_data="adm_shortener_credentials")],
+        [InlineKeyboardButton("📚 Set Tutorial Link", callback_data="adm_shortener_tutorial")],
+        [InlineKeyboardButton("🧪 Test Shortener", callback_data="adm_shortener_test")],
+        [InlineKeyboardButton("➕ Add Premium Bypass", callback_data="adm_shortener_add_bypass"),
+         InlineKeyboardButton("➖ Remove Premium Bypass", callback_data="adm_shortener_remove_bypass")],
+        [InlineKeyboardButton("🔙 Admin Panel", callback_data="adm_back")],
+    ])
+
+
+async def _process_start_payload(client: Client, user_id: int, message: Message, param: str):
+    """Apply the optional shortener gate, then use the unchanged ANIFLIX delivery path."""
+    signing_secret = str(bot.settings.bot_token)
+    original_param, is_verified_short_link = unwrap_shortener_start_param(param, signing_secret)
+    if param.startswith("as1_") and not is_verified_short_link:
+        return await message.reply_text(
+            "❌ This shortener link is invalid or has expired. Please open the original file link again."
+        )
+    if is_verified_short_link:
+        return await _deliver_start_payload(client, user_id, message, original_param)
+
+    shortener = _url_shortener_settings()
+    exempt_users = set(shortener.get("bypass_users", []))
+    is_exempt = user_id == bot.settings.owner_id or user_id in exempt_users
+    if shortener["enabled"] and not is_exempt:
+        if not shortener.get("domain") or not shortener.get("api_key"):
+            return await message.reply_text(
+                "⚠️ The URL shortener is enabled but not configured correctly. Please contact the bot administrator."
+            )
+        try:
+            signed_param = make_shortener_start_param(param, signing_secret)
+            destination = f"https://t.me/{bot.username}?start={signed_param}"
+            short_link = await shorten_url(destination, shortener["domain"], shortener["api_key"])
+        except Exception as exc:
+            logger.warning("URL shortener could not create a link: %s", exc)
+            return await message.reply_text(
+                "⚠️ The shortener service is temporarily unavailable. Your file link is safe; please try again later."
+            )
+
+        buttons = [[InlineKeyboardButton("🔗 OPEN FILE LINK", url=short_link)]]
+        tutorial = str(shortener.get("tutorial_link") or "").strip()
+        if tutorial:
+            buttons.append([InlineKeyboardButton("📚 HOW TO OPEN", url=tutorial)])
+        return await message.reply_text(
+            "🔐 **Your file link is ready!**\n\n"
+            "Open the shortened link below to continue to your requested files.",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    return await _deliver_start_payload(client, user_id, message, param)
+
+
 # ------------------- HELPER FUNCTIONS ------------------- #
 
 def is_admin(user_id: int) -> bool:
@@ -767,7 +884,7 @@ async def start_handler(client: Client, message: Message):
                 default_text=default_fsub_text,
                 reply_markup=get_fsub_keyboard(unjoined, redirect_data=param),
             )
-        return await _deliver_start_payload(client, user_id, message, param)
+        return await _process_start_payload(client, user_id, message, param)
     return await _reply_welcome(message, message.from_user.first_name)
 
 
@@ -975,9 +1092,20 @@ async def admin_panel(client: Client, message: Message):
          InlineKeyboardButton("📊 Bot Status", callback_data="adm_status")],
         [InlineKeyboardButton("📝 Edit Welcome", callback_data="adm_edit_welcome"),
          InlineKeyboardButton("📬 Broadcast", callback_data="adm_broadcast")],
-        [InlineKeyboardButton("📥 Epi Collecting", callback_data="adm_epicollect")]
+        [InlineKeyboardButton("📥 Epi Collecting", callback_data="adm_epicollect")],
+        [InlineKeyboardButton("🔗 URL Shortener", callback_data="adm_shortener")]
     ])
     await message.reply_text(text, reply_markup=kb)
+
+
+@bot.on_message(filters.command(["shortner", "shortener"]) & filters.private)
+async def url_shortener_command(client: Client, message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.reply_text("⛔ Unauthorized.")
+    await message.reply_text(
+        _url_shortener_panel_text(),
+        reply_markup=_url_shortener_panel_keyboard(),
+    )
 
 
 @bot.on_message(filters.command("status") & filters.private)
@@ -1125,7 +1253,7 @@ def _normalize_messages(result):
         messages = [result]
     return sorted(messages, key=lambda item: int(item.id))
 
-@bot.on_message(filters.private & ~filters.command(["start", "admin", "getlink", "batch", "broadcast", "users", "status"]))
+@bot.on_message(filters.private & ~filters.command(["start", "admin", "getlink", "batch", "broadcast", "users", "status", "shortner", "shortener"]))
 async def incoming_private_messages(client: Client, message: Message):
     user_id = message.from_user.id
 
@@ -1216,6 +1344,68 @@ async def incoming_private_messages(client: Client, message: Message):
             ADMIN_PENDING_ACTIONS.pop(user_id, None)
             ADMIN_PENDING_DATA.pop(user_id, None)
             return await message.reply_text("✅ FSUB channel display name updated.")
+
+        if action == "url_shortener_credentials":
+            raw = (message.text or "").strip()
+            parts = raw.split(maxsplit=1)
+            if len(parts) != 2:
+                return await message.reply_text(
+                    "Send the domain and API key together, for example:\n`example.com YOUR_API_KEY`"
+                )
+            try:
+                domain = normalize_shortener_domain(parts[0])
+                api_key = parts[1].strip()
+                if not api_key or len(api_key) > 512:
+                    raise ValueError("API key must contain 1–512 characters.")
+            except ValueError as exc:
+                return await message.reply_text(f"⚠️ {exc}\nPlease try again, or /cancel.")
+            await _set_url_shortener_setting("domain", domain)
+            await _set_url_shortener_setting("api_key", api_key)
+            ADMIN_PENDING_ACTIONS.pop(user_id, None)
+            return await message.reply_text(
+                "✅ Shortener domain and API key saved in SQLite.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔗 Open URL Shortener Settings", callback_data="adm_shortener")]
+                ]),
+            )
+
+        if action == "url_shortener_tutorial":
+            tutorial = (message.text or "").strip()
+            if tutorial.lower() == "/clear":
+                await _set_url_shortener_setting("tutorial_link", "")
+            elif not is_http_url(tutorial):
+                return await message.reply_text("Send a valid http:// or https:// URL, /clear, or /cancel.")
+            else:
+                await _set_url_shortener_setting("tutorial_link", tutorial)
+            ADMIN_PENDING_ACTIONS.pop(user_id, None)
+            return await message.reply_text(
+                "✅ Tutorial link setting saved.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔗 Open URL Shortener Settings", callback_data="adm_shortener")]
+                ]),
+            )
+
+        if action in {"url_shortener_add_bypass", "url_shortener_remove_bypass"}:
+            raw_user_id = (message.text or "").strip()
+            if not raw_user_id.isdigit() or int(raw_user_id) <= 0:
+                return await message.reply_text("Send a positive numeric Telegram user ID, or /cancel.")
+            target_user_id = int(raw_user_id)
+            settings = _url_shortener_settings()
+            bypass_users = set(settings.get("bypass_users", []))
+            if action == "url_shortener_add_bypass":
+                bypass_users.add(target_user_id)
+                result_text = f"✅ User `{target_user_id}` added to shortener bypass."
+            else:
+                bypass_users.discard(target_user_id)
+                result_text = f"✅ User `{target_user_id}` removed from shortener bypass."
+            await _set_url_shortener_setting("bypass_users", sorted(bypass_users))
+            ADMIN_PENDING_ACTIONS.pop(user_id, None)
+            return await message.reply_text(
+                result_text,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔗 Open URL Shortener Settings", callback_data="adm_shortener")]
+                ]),
+            )
 
         value = _admin_message_payload(message)
         if value is None:
@@ -1468,7 +1658,7 @@ async def callback_router(client: Client, query: CallbackQuery):
         await query.answer("✅ Verification passed!")
         await query.message.delete()
         if param:
-            return await _deliver_start_payload(client, user_id, query.message, param)
+            return await _process_start_payload(client, user_id, query.message, param)
         return await _reply_welcome(query.message, query.from_user.first_name)
 
     if data == "gen_link_finish":
@@ -1635,6 +1825,100 @@ async def callback_router(client: Client, query: CallbackQuery):
             reply_markup=_auto_collection_settings_keyboard(),
         )
 
+    elif data == "adm_shortener":
+        ADMIN_PENDING_ACTIONS.pop(user_id, None)
+        ADMIN_PENDING_DATA.pop(user_id, None)
+        await query.answer()
+        await query.message.edit_text(
+            _url_shortener_panel_text(),
+            reply_markup=_url_shortener_panel_keyboard(),
+        )
+
+    elif data == "adm_shortener_toggle":
+        settings = _url_shortener_settings()
+        new_status = not settings["enabled"]
+        if new_status and (not settings.get("domain") or not settings.get("api_key")):
+            return await query.answer(
+                "Set the shortener domain and API key before enabling it.", show_alert=True
+            )
+        await _set_url_shortener_setting("enabled", new_status)
+        await query.answer("URL shortener enabled." if new_status else "URL shortener disabled.")
+        await query.message.edit_text(
+            _url_shortener_panel_text(),
+            reply_markup=_url_shortener_panel_keyboard(),
+        )
+
+    elif data == "adm_shortener_credentials":
+        ADMIN_PENDING_ACTIONS[user_id] = "url_shortener_credentials"
+        ADMIN_PENDING_DATA.pop(user_id, None)
+        await query.answer()
+        await query.message.edit_text(
+            "⚙️ **SET SHORTENER DOMAIN + API KEY**\n\n"
+            "Send both values in one message in this format:\n"
+            "`domain.com YOUR_API_KEY`\n\n"
+            "You may also include `https://` before the domain. Do not include a path.\n"
+            "Use /cancel to abort. The API key is stored in SQLite and is not added to the archive state message."
+        )
+
+    elif data == "adm_shortener_tutorial":
+        ADMIN_PENDING_ACTIONS[user_id] = "url_shortener_tutorial"
+        ADMIN_PENDING_DATA.pop(user_id, None)
+        await query.answer()
+        current_tutorial = _url_shortener_settings().get("tutorial_link") or "Not configured"
+        await query.message.edit_text(
+            "📚 **SET SHORTENER TUTORIAL LINK**\n\n"
+            f"Current link: `{current_tutorial}`\n\n"
+            "Send a valid http:// or https:// tutorial URL. Send `/clear` to remove it, or /cancel to abort."
+        )
+
+    elif data == "adm_shortener_test":
+        settings = _url_shortener_settings()
+        if not settings.get("domain") or not settings.get("api_key"):
+            return await query.answer("Configure the domain and API key first.", show_alert=True)
+        await query.answer("Testing the shortener API...")
+        await query.message.edit_text("🧪 **Testing URL shortener...**")
+        try:
+            test_link = await shorten_url(
+                "https://example.com/aniflix-shortener-test",
+                settings["domain"], settings["api_key"],
+            )
+            result_text = (
+                "✅ **URL SHORTENER TEST PASSED**\n\n"
+                f"Test result: `{test_link}`\n\n"
+                "The provider returned a valid shortened URL."
+            )
+        except Exception as exc:
+            logger.warning("Admin URL shortener test failed: %s", exc)
+            result_text = f"❌ **URL SHORTENER TEST FAILED**\n\n`{str(exc)[:500]}`"
+        await query.message.edit_text(
+            result_text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 URL Shortener Settings", callback_data="adm_shortener")]
+            ]),
+        )
+
+    elif data == "adm_shortener_add_bypass":
+        ADMIN_PENDING_ACTIONS[user_id] = "url_shortener_add_bypass"
+        ADMIN_PENDING_DATA.pop(user_id, None)
+        await query.answer()
+        await query.message.edit_text(
+            "➕ **ADD PREMIUM SHORTENER BYPASS**\n\n"
+            "Send the user's numeric Telegram ID. This user will receive direct file links without the shortener.\n"
+            "Use /cancel to abort."
+        )
+
+    elif data == "adm_shortener_remove_bypass":
+        ADMIN_PENDING_ACTIONS[user_id] = "url_shortener_remove_bypass"
+        ADMIN_PENDING_DATA.pop(user_id, None)
+        current_ids = _url_shortener_settings().get("bypass_users", [])
+        ids_text = ", ".join(str(item) for item in current_ids) if current_ids else "None"
+        await query.answer()
+        await query.message.edit_text(
+            "➖ **REMOVE PREMIUM SHORTENER BYPASS**\n\n"
+            f"Current bypass IDs: `{ids_text}`\n\n"
+            "Send the numeric Telegram ID to remove, or /cancel to abort."
+        )
+
     elif data == "adm_status":
         await query.answer()
         stats = bot.state_store.get_stats()
@@ -1685,7 +1969,8 @@ async def callback_router(client: Client, query: CallbackQuery):
              InlineKeyboardButton("📊 Bot Status", callback_data="adm_status")],
             [InlineKeyboardButton("📝 Edit Welcome", callback_data="adm_edit_welcome"),
              InlineKeyboardButton("📬 Broadcast", callback_data="adm_broadcast")],
-            [InlineKeyboardButton("📥 Epi Collecting", callback_data="adm_epicollect")]
+            [InlineKeyboardButton("📥 Epi Collecting", callback_data="adm_epicollect")],
+            [InlineKeyboardButton("🔗 URL Shortener", callback_data="adm_shortener")]
         ])
         await query.message.edit_text(text, reply_markup=kb)
 

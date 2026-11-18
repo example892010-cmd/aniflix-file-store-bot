@@ -107,3 +107,20 @@ Tests using fake Telegram clients are local checks only. They do not verify a re
 Promote the bot to administrator in the source channel and grant **Delete Messages** permission. A channel administrator can post `/getlinkauto` to start collection. The bot then collects subsequent channel posts, resetting a 3-second quiet-period timer after each post. When the channel is quiet for 3 seconds, it archives and verifies every collected post, creates one combined batch deep link, and posts a renamed summary with the detected anime title, season, and episode numbers. Only after the archive manifest and result post are saved does it delete the collected source posts and the `/getlinkauto` trigger post.
 
 The auto-link manifest uses a fanout tree of archive manifests so large batches can still be represented by one link. Existing `/getlink`, `/batch`, and legacy batch links retain their existing formats and workflows. The bot must have permission to post in the channel and delete messages there. Episode and title detection is based on filenames/captions; ambiguous or missing filename metadata may require manual renaming.
+
+## URL shortener (SQLite)
+
+The Admin Panel includes a **URL Shortener** page (also available with `/shortner`). It supports:
+
+- Enable/disable the shortener.
+- Configure the HTTPS provider domain and API key using the provider's `/api?api=...&url=...&alias=...` endpoint contract.
+- Configure an optional tutorial URL.
+- Test the provider API from the panel.
+- Maintain a SQLite-backed list of Telegram user IDs that bypass the shortener (for premium/manual exemptions).
+
+The shortener is disabled by default. Configure the provider credentials and test them before enabling it. When enabled, normal file deep links are intercepted at `/start`; the user receives a short link that redirects to a signed ANIFLIX continuation payload. The signature prevents users from simply editing the continuation payload to skip the shortener. Force-subscription is still checked before a file is delivered, including after the short-link redirect.
+
+Shortener settings, including the API key, are saved in the dedicated SQLite `app_settings` table. They are not added to the archive-channel state snapshot. The additive SQLite schema migration creates this table and backs up an existing recognized database before migration. No MongoDB dependency or external database is used.
+
+To configure: open `/admin` → **URL Shortener** → **Set Domain + API Key**, send `your-domain.example YOUR_API_KEY`, then set the tutorial URL if needed, test the API, and enable the shortener. Use the bypass-user controls to exempt premium/manual user IDs.
+

@@ -59,6 +59,7 @@ class SQLiteStoreTests(unittest.TestCase):
             }
             self.assertIn("file_records", tables)
             self.assertIn("link_records", tables)
+            self.assertIn("app_settings", tables)
             db.close()
 
     def test_unrecognized_database_is_backed_up_and_not_modified(self):
@@ -81,6 +82,36 @@ class SQLiteStoreTests(unittest.TestCase):
                 "SELECT name FROM sqlite_master WHERE name='file_records'"
             ).fetchone())
             conn.close()
+
+
+    def test_application_settings_round_trip_without_entering_state_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "aniflix.sqlite3")
+            db = SQLiteStore(path)
+            db.save_state({"admins": [123], "stats": {"total_links": 4}}, 1)
+            db.set_app_setting("url_shortener", "api_key", "private-api-value")
+            db.set_app_setting("url_shortener", "enabled", True)
+            self.assertEqual(
+                db.get_app_settings("url_shortener"),
+                {"api_key": "private-api-value", "enabled": True},
+            )
+            snapshot, revision = db.load_state()
+            self.assertEqual(snapshot, {"admins": [123], "stats": {"total_links": 4}})
+            self.assertEqual(revision, 1)
+            db.close()
+
+    def test_application_settings_survive_reopening_sqlite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "aniflix.sqlite3")
+            db = SQLiteStore(path)
+            db.set_app_setting("url_shortener", "tutorial_link", "https://t.me/example/4")
+            db.close()
+            reopened = SQLiteStore(path)
+            self.assertEqual(
+                reopened.get_app_setting("url_shortener", "tutorial_link"),
+                "https://t.me/example/4",
+            )
+            reopened.close()
 
     def test_unknown_future_schema_is_not_modified(self):
         with tempfile.TemporaryDirectory() as tmp:

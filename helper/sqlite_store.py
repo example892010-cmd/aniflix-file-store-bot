@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class SQLiteStore:
@@ -67,7 +67,7 @@ class SQLiteStore:
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 )
             }
-            known_tables = {"state_snapshot", "file_records", "link_records"}
+            known_tables = {"state_snapshot", "file_records", "link_records", "app_settings"}
             user_tables = existing_tables - {"sqlite_sequence"}
             if user_tables and not (user_tables & known_tables):
                 backup_path = self.path + ".pre-migration.bak"
@@ -90,6 +90,7 @@ class SQLiteStore:
                     "file_size", "caption", "uploader_id", "created_at",
                 },
                 "link_records": {"id", "payload", "link_type", "archive_message_id", "created_at"},
+                "app_settings": {"namespace", "key", "value", "updated_at"},
             }
             for table_name in user_tables & known_tables:
                 columns = {
@@ -141,6 +142,13 @@ class SQLiteStore:
                     link_type TEXT NOT NULL,
                     archive_message_id INTEGER NOT NULL,
                     created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    namespace TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(namespace, key)
                 );
                 """
             )
@@ -224,6 +232,48 @@ class SQLiteStore:
                 """INSERT OR IGNORE INTO link_records(payload, link_type, archive_message_id, created_at)
                    VALUES(?, ?, ?, ?)""",
                 (str(payload), str(link_type), int(archive_message_id), now),
+            )
+
+    def get_app_setting(self, namespace: str, key: str, default: Any = None) -> Any:
+        """Read an application setting stored outside the archive state snapshot."""
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT value FROM app_settings WHERE namespace=? AND key=?",
+                (str(namespace), str(key)),
+            ).fetchone()
+        if not row:
+            return default
+        try:
+            return json.loads(row["value"])
+        except (TypeError, json.JSONDecodeError):
+            return default
+
+    def get_app_settings(self, namespace: str) -> dict[str, Any]:
+        """Read all settings for one namespace, decoding their JSON values."""
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT key, value FROM app_settings WHERE namespace=?",
+                (str(namespace),),
+            ).fetchall()
+        result: dict[str, Any] = {}
+        for row in rows:
+            try:
+                result[str(row["key"])] = json.loads(row["value"])
+            except (TypeError, json.JSONDecodeError):
+                logger.warning("Ignoring malformed app setting %s/%s", namespace, row["key"])
+        return result
+
+    def set_app_setting(self, namespace: str, key: str, value: Any) -> None:
+        """Persist one application setting without putting secrets in remote state."""
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._connection:
+            self._connection.execute(
+                """INSERT INTO app_settings(namespace, key, value, updated_at)
+                   VALUES(?, ?, ?, ?)
+                   ON CONFLICT(namespace, key) DO UPDATE SET
+                       value=excluded.value, updated_at=excluded.updated_at""",
+                (str(namespace), str(key), encoded, now),
             )
 
     def close(self) -> None:
